@@ -66,9 +66,7 @@ case "$PLATFORM" in
         echo -e "${GREEN}Running Linux/macOS bash setup...${NC}"
         echo ""
         # Make scripts executable if not already
-        chmod +x "$SCRIPT_DIR/setup-environment.sh" 2>/dev/null || true
-        chmod +x "$SCRIPT_DIR/setup-desktop.sh" 2>/dev/null || true
-        chmod +x "$SCRIPT_DIR/setup-server.sh" 2>/dev/null || true
+        chmod +x "$SCRIPT_DIR"/{setup-environment,setup-desktop,setup-server}.sh 2>/dev/null || true
         
         # Run the setup script
         bash "$SCRIPT_DIR/setup-environment.sh" "$@"
