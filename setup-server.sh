@@ -81,7 +81,7 @@ install_java() {
     
     local java_version=""
     if command_exists java; then
-        java_version=$(java -version 2>&1 | grep -oP 'version "\K[0-9]+' || echo "")
+        java_version=$(java -version 2>&1 | grep -o 'version "[0-9]*' | cut -d'"' -f2 || echo "")
     fi
     
     if [[ -z "$java_version" ]] || [[ "$java_version" != "17" ]]; then
@@ -299,6 +299,9 @@ if ! command -v java &> /dev/null; then
     exit 1
 fi
 
+# Detect JAVA_HOME
+DETECTED_JAVA_HOME=\$(dirname \$(dirname \$(readlink -f \$(which java))))
+
 # Create systemd service file
 echo "Creating systemd service file: $SERVICE_FILE..."
 cat > "$SERVICE_FILE" << SERVICEEOF
@@ -321,7 +324,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 
 # Environment
-Environment="JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+Environment="JAVA_HOME=\${DETECTED_JAVA_HOME}"
 
 [Install]
 WantedBy=multi-user.target
