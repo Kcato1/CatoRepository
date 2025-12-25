@@ -49,6 +49,18 @@ This repository includes automated setup scripts for multiple platforms:
 
 ## Quick Start
 
+### Universal Setup (Recommended)
+
+The easiest way to get started is using the universal `setup.sh` script that automatically detects your platform:
+
+```bash
+# For development environment
+./setup.sh -e Desktop
+
+# For server environment (Linux/macOS)
+sudo ./setup.sh -e Server
+```
+
 ### Windows
 
 #### For Desktop PCs (Development Environment)
@@ -503,6 +515,26 @@ sudo systemctl restart nginx
 ```
 
 ## Script Details
+
+### setup.sh (Universal Launcher)
+
+**Cross-platform setup launcher** that automatically detects your operating system and runs the appropriate setup script.
+
+**Parameters:**
+- `-e` (Required) - Type of environment: `Desktop` or `Server`
+- `-n` (Optional) - Computer name identifier
+- `-h` - Show help message
+
+**Example:**
+```bash
+./setup.sh -e Desktop -n "Dev-Workstation"
+```
+
+**Features:**
+- Auto-detects Windows, macOS, or Linux
+- Routes to appropriate platform-specific script
+- Makes scripts executable automatically
+- Unified interface across all platforms
 
 ### setup-environment.ps1
 
