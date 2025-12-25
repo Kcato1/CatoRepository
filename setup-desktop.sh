@@ -96,7 +96,7 @@ install_java() {
     
     local java_version=""
     if command_exists java; then
-        java_version=$(java -version 2>&1 | grep -oP 'version "\K[0-9]+')
+        java_version=$(java -version 2>&1 | grep -o 'version "[0-9]*' | cut -d'"' -f2)
     fi
     
     if [[ -z "$java_version" ]] || [[ "$java_version" != "17" ]]; then
