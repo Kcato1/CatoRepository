@@ -96,7 +96,7 @@ install_java() {
     
     local java_version=""
     if command_exists java; then
-        java_version=$(java -version 2>&1 | grep -o 'version "[0-9]*' | cut -d'"' -f2)
+        java_version=$(java -version 2>&1 | grep -oE '\"[0-9]+' | tr -d '"')
     fi
     
     if [[ -z "$java_version" ]] || [[ "$java_version" != "17" ]]; then
@@ -127,7 +127,19 @@ install_java() {
         
         case "$OS" in
             macos)
-                export JAVA_HOME=$(/usr/libexec/java_home -v 17 2>/dev/null || echo "/opt/homebrew/opt/openjdk@17")
+                # Try java_home utility first, then check common Homebrew locations
+                if command -v /usr/libexec/java_home &> /dev/null; then
+                    export JAVA_HOME=$(/usr/libexec/java_home -v 17 2>/dev/null)
+                fi
+                
+                # Fallback to Homebrew locations (ARM and Intel)
+                if [[ -z "$JAVA_HOME" ]] || [[ ! -d "$JAVA_HOME" ]]; then
+                    if [[ -d "/opt/homebrew/opt/openjdk@17" ]]; then
+                        export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
+                    elif [[ -d "/usr/local/opt/openjdk@17" ]]; then
+                        export JAVA_HOME="/usr/local/opt/openjdk@17"
+                    fi
+                fi
                 ;;
             debian|redhat)
                 export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
