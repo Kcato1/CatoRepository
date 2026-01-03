@@ -1,0 +1,79 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Java sources
+*.java text diff=java
+*.kt text diff=kotlin
+*.groovy text diff=java
+*.scala text diff=java
+
+# Maven
+pom.xml text diff=xml
+*.xml text diff=xml
+
+# Documentation
+*.md text diff=markdown
+*.txt text
+*.adoc text
+*.textile text
+*.mustache text
+*.csv text
+*.tab text
+*.tsv text
+*.sql text
+
+# Configuration files
+*.yaml text
+*.yml text
+*.json text
+*.toml text
+*.ini text
+*.properties text
+*.conf text
+*.config text
+
+# Scripts
+*.sh text eol=lf
+*.bash text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Graphics
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg text
+
+# Archives
+*.jar binary
+*.war binary
+*.ear binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.7z binary
+*.rar binary
+
+# Fonts
+*.ttf binary
+*.eot binary
+*.woff binary
+*.woff2 binary
+
+# Documents
+*.pdf binary
+*.doc binary
+*.docx binary
+*.xls binary
+*.xlsx binary
+*.ppt binary
+*.pptx binary
+
+# Other
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
