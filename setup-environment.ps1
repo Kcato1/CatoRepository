@@ -24,25 +24,16 @@ param(
     [string]$ComputerName = $env:COMPUTERNAME
 )
 
-# Require Administrator
-if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Error "This script requires Administrator privileges. Please run as Administrator."
-    exit 1
-}
-
 # Script configuration
 $ErrorActionPreference = "Stop"
 $ScriptRoot = $PSScriptRoot
 $LogFile = Join-Path $ScriptRoot "setup-log-$ComputerName-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 
-# Logging function
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "[$timestamp] [$Level] $Message"
-    Write-Host $logMessage
-    Add-Content -Path $LogFile -Value $logMessage
-}
+# Import common module
+Import-Module "$PSScriptRoot\lib\common.psm1" -Force
+
+# Require Administrator
+Require-Administrator
 
 # Banner
 function Show-Banner {
