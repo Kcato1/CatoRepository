@@ -19,20 +19,8 @@ COMPUTER_NAME=$(hostname)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/setup-log-$COMPUTER_NAME-$(date +%Y%m%d-%H%M%S).txt"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-# Logging function
-log() {
-    local level=${2:-INFO}
-    local message="[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $1"
-    echo -e "$message"
-    echo "$message" >> "$LOG_FILE"
-}
+# Source common library
+source "$SCRIPT_DIR/lib/common.sh"
 
 # Check if running as root/sudo
 check_privileges() {

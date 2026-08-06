@@ -18,49 +18,9 @@ set -e
 COMPUTER_NAME=${1:-$(hostname)}
 LOG_FILE=${2:-"setup-log-$COMPUTER_NAME-$(date +%Y%m%d-%H%M%S).txt"}
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m'
-
-# Detect OS
-detect_os() {
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        OS="macos"
-        PKG_MGR="brew"
-    elif [[ -f /etc/debian_version ]]; then
-        OS="debian"
-        PKG_MGR="apt"
-    elif [[ -f /etc/redhat-release ]]; then
-        OS="redhat"
-        if command -v dnf &> /dev/null; then
-            PKG_MGR="dnf"
-        else
-            PKG_MGR="yum"
-        fi
-    else
-        OS="unknown"
-        PKG_MGR="unknown"
-    fi
-}
-
-# Logging function
-log() {
-    local level=${2:-INFO}
-    local message="[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $1"
-    echo -e "$message"
-    if [[ -n "$LOG_FILE" ]]; then
-        echo "$message" >> "$LOG_FILE"
-    fi
-}
-
-# Check if command exists
-command_exists() {
-    command -v "$1" &> /dev/null
-}
+# Source common library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
 
 # Install package manager (Homebrew for macOS)
 install_package_manager() {
