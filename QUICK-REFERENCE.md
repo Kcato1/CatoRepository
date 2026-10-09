@@ -48,8 +48,9 @@ df = pd.read_excel('data.xlsx', sheet_name='Sheet1')
 df = pd.read_json('data.json')
 
 # SQL
+import os
 import sqlalchemy as sa
-engine = sa.create_engine('postgresql://user:pass@localhost/db')
+engine = sa.create_engine(os.environ['DATABASE_URL'])  # e.g. postgresql://user@localhost/db
 df = pd.read_sql('SELECT * FROM table', engine)
 
 # Parquet (efficient for large data)
@@ -317,15 +318,16 @@ print(f"Mean: {scores.mean()}, Std: {scores.std()}")
 ### PostgreSQL Connection
 
 ```python
+import os
 import psycopg2
 import pandas as pd
 
-# Connect
+# Connect (set PGPASSWORD in your environment, never in code)
 conn = psycopg2.connect(
     host="localhost",
     database="mydb",
     user="postgres",
-    password="password"
+    password=os.environ["PGPASSWORD"]
 )
 
 # Query to DataFrame

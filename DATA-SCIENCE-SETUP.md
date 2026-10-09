@@ -391,7 +391,7 @@ Create `.vscode/settings.json` in your project:
    CREATE DATABASE mydata;
    
    -- Create user
-   CREATE USER datauser WITH PASSWORD 'password';
+   CREATE USER datauser WITH PASSWORD '<choose-a-strong-password>';
    
    -- Grant privileges
    GRANT ALL PRIVILEGES ON DATABASE mydata TO datauser;
@@ -399,13 +399,14 @@ Create `.vscode/settings.json` in your project:
 
 3. **Connect from Python:**
    ```python
+   import os
    import psycopg2
    
    conn = psycopg2.connect(
        host="localhost",
        database="mydata",
        user="datauser",
-       password="password"
+       password=os.environ["PGPASSWORD"]
    )
    ```
 

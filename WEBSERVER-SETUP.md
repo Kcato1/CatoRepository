@@ -219,7 +219,7 @@ http-server -p 8080
 
 ```bash
 # Enable basic authentication
-http-server --username admin --password secret
+http-server --username admin --password "$HTTP_SERVER_PASSWORD"
 
 # HTTPS with SSL certificate
 http-server -S -C cert.pem -K key.pem
