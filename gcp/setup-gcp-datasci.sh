@@ -21,7 +21,7 @@ for arg in "$@"; do
     esac
 done
 
-if [ "$EUID" -eq 0 ]; then
+if [[ "$EUID" -eq 0 ]]; then
     echo "Run this as your normal user, not root. It will call sudo when needed."
     exit 1
 fi
@@ -42,6 +42,7 @@ log() {
         WARNING) color=$YELLOW ;;
         ERROR)   color=$RED ;;
         STEP)    color=$CYAN ;;
+        *)       color=$NC ;;
     esac
     echo -e "${color}[$(date '+%H:%M:%S')] [$level] $*${NC}" | tee -a "$LOG_FILE"
 }
@@ -49,10 +50,11 @@ log() {
 trap 'log ERROR "Failed at line $LINENO. See $LOG_FILE"' ERR
 
 METADATA="http://metadata.google.internal/computeMetadata/v1"
-if curl -sf -H "Metadata-Flavor: Google" "$METADATA/instance/zone" >/dev/null 2>&1; then
-    ZONE=$(curl -s -H "Metadata-Flavor: Google" "$METADATA/instance/zone" | cut -d/ -f4)
-    INSTANCE=$(curl -s -H "Metadata-Flavor: Google" "$METADATA/instance/name")
-    PROJECT=$(curl -s -H "Metadata-Flavor: Google" "$METADATA/project/project-id")
+METADATA_HEADER="Metadata-Flavor: Google"
+if curl -sf -H "$METADATA_HEADER" "$METADATA/instance/zone" >/dev/null 2>&1; then
+    ZONE=$(curl -s -H "$METADATA_HEADER" "$METADATA/instance/zone" | cut -d/ -f4)
+    INSTANCE=$(curl -s -H "$METADATA_HEADER" "$METADATA/instance/name")
+    PROJECT=$(curl -s -H "$METADATA_HEADER" "$METADATA/project/project-id")
     log SUCCESS "GCP VM detected: $INSTANCE ($ZONE) in project $PROJECT"
 else
     ZONE="<zone>"; INSTANCE="<instance>"; PROJECT="<project>"
@@ -76,7 +78,7 @@ log STEP "2/7 Google Cloud CLI"
 if command -v gcloud >/dev/null 2>&1; then
     log SUCCESS "gcloud already installed"
 else
-    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    curl -fsSL --proto '=https' --tlsv1.2 https://packages.cloud.google.com/apt/doc/apt-key.gpg \
         | sudo gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
         | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
@@ -87,14 +89,14 @@ fi
 
 # A venv keeps packages out of Ubuntu's system Python (PEP 668 blocks global pip on 24.04).
 log STEP "3/7 Python virtual environment at $VENV_DIR"
-[ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
+[[ -d "$VENV_DIR" ]] || python3 -m venv "$VENV_DIR"
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
-pip install --quiet --upgrade pip setuptools wheel
+pip install --quiet --only-binary :all: --upgrade pip setuptools wheel
 log SUCCESS "Virtual environment ready"
 
 log STEP "4/7 Data science + GCP packages"
-pip install --quiet --upgrade \
+pip install --quiet --only-binary :all: --upgrade \
     numpy pandas scipy matplotlib seaborn plotly scikit-learn statsmodels \
     jupyterlab ipykernel \
     polars "dask[dataframe]" pyarrow \
@@ -106,10 +108,10 @@ pip install --quiet --upgrade \
     dbt-bigquery >>"$LOG_FILE" 2>&1
 log SUCCESS "Core packages installed"
 
-if [ "$SKIP_ML" = false ]; then
+if [[ "$SKIP_ML" = false ]]; then
     log STEP "5/7 ML frameworks (TensorFlow, PyTorch CPU)"
-    pip install --quiet tensorflow >>"$LOG_FILE" 2>&1
-    pip install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cpu >>"$LOG_FILE" 2>&1
+    pip install --quiet --only-binary :all: tensorflow >>"$LOG_FILE" 2>&1
+    pip install --quiet --only-binary :all: torch torchvision --index-url https://download.pytorch.org/whl/cpu >>"$LOG_FILE" 2>&1
     log SUCCESS "TensorFlow and PyTorch installed"
 else
     log WARNING "5/7 Skipping ML frameworks (--skip-ml)"
@@ -120,7 +122,7 @@ python -m ipykernel install --user --name datasci --display-name "Python (datasc
 mkdir -p "$WORKSPACE_DIR"/{projects,datasets,notebooks,scripts,models,outputs}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -d "$SCRIPT_DIR/examples" ]; then
+if [[ -d "$SCRIPT_DIR/examples" ]]; then
     cp -r "$SCRIPT_DIR/examples" "$WORKSPACE_DIR/scripts/gcp-examples"
 fi
 log SUCCESS "Workspace ready at $WORKSPACE_DIR"
