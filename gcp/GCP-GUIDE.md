@@ -1,6 +1,6 @@
 # GCP Data Science Guide
 
-Running Python + SQL data work on Google Cloud: a Compute Engine VM you control, a managed Vertex AI Workbench notebook, Python examples for BigQuery / Cloud Storage / Cloud SQL, and a plan for moving your local setup over.
+Running Python + SQL data work on Google Cloud: a Compute Engine VM you control, a managed Vertex AI Workbench notebook, Python examples for BigQuery / Cloud Storage / Cloud SQL, a plan for moving your local setup over, and deploying the Catoconsting app to Cloud Run.
 
 ## Contents
 
@@ -9,7 +9,8 @@ Running Python + SQL data work on Google Cloud: a Compute Engine VM you control,
 3. [Option B: Vertex AI Workbench](#3-option-b-vertex-ai-workbench)
 4. [Python examples](#4-python-examples)
 5. [Migrating from local to GCP](#5-migrating-from-local-to-gcp)
-6. [Keeping costs down](#6-keeping-costs-down)
+6. [Deploying the Catoconsting app to Cloud Run](#6-deploying-the-catoconsting-app-to-cloud-run)
+7. [Keeping costs down](#7-keeping-costs-down)
 
 ---
 
@@ -287,15 +288,65 @@ gcloud storage cp -r gs://my-datasci-proj-data/notebooks ~/DataScience/
 - [ ] Code updated to `gs://` paths, connector, Secret Manager
 - [ ] Notebooks moved
 - [ ] Scheduled jobs recreated
+- [ ] App deploys to Cloud Run (section 6) and Azure resources retired
 - [ ] Local copies kept until everything is verified in GCP
 
 ---
 
-## 6. Keeping costs down
+## 6. Deploying the Catoconsting app to Cloud Run
+
+`.github/workflows/deploy-cloud-run.yml` replaces the old Azure Web App workflow. On every push to `main` (or a manual run from the Actions tab) it:
+
+1. Builds the JAR with Maven on Java 17
+2. Packages it with the root `Dockerfile` (Temurin 17 JRE, runs as a non-root user, listens on Cloud Run's `PORT`)
+3. Pushes the image to Artifact Registry, tagged with the commit SHA
+4. Deploys the `catoconsting` Cloud Run service and prints its URL in the run summary
+
+GitHub authenticates to GCP with **Workload Identity Federation**, so no service-account key is stored in GitHub. Only runs from `main` of this repository are accepted.
+
+### One-time setup
+
+```bash
+bash gcp/setup-cloud-run-cicd.sh my-datasci-proj us-central1
+```
+
+This creates the Artifact Registry repo, a deployer and a runtime service account, and the federation provider, then prints five `gh variable set` commands. Run them (or add the values under **Settings → Secrets and variables → Actions → Variables**):
+
+| Variable | Example |
+|---|---|
+| `GCP_PROJECT_ID` | `my-datasci-proj` |
+| `GCP_REGION` | `us-central1` |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/123456789/locations/global/workloadIdentityPools/github/providers/github-actions` |
+| `GCP_DEPLOY_SERVICE_ACCOUNT` | `catoconsting-deployer@my-datasci-proj.iam.gserviceaccount.com` |
+| `GCP_RUNTIME_SERVICE_ACCOUNT` | `catoconsting-runtime@my-datasci-proj.iam.gserviceaccount.com` |
+
+Then trigger it from **Actions → Build and deploy to Cloud Run - Catoconsting → Run workflow** on `main`.
+
+### Notes
+
+- **The repo must contain the app source.** The workflow runs `mvn package` at the repo root, so it needs `pom.xml` and `src/` committed here, the same as the Azure workflow did.
+- **Public access:** the service is deployed with `--allow-unauthenticated`, like the Azure Web App. Remove that flag from the workflow to require IAM auth. If your organization blocks public services (domain-restricted sharing), the deploy step will fail on that flag.
+- **App config:** add environment variables or secrets with the `env_vars` / `secrets` inputs of the `deploy-cloudrun` step. Grant any GCP roles the app needs (Cloud SQL, Storage, ...) to the runtime service account, not the deployer.
+- **Port:** the container passes `-Dserver.port=$PORT`, which Spring Boot honors. A non-Spring app should read the `PORT` environment variable.
+- **Retiring Azure:** once Cloud Run is serving, delete the `AZUREAPPSERVICE_PUBLISHPROFILE_...` repository secret and the Azure Web App so you stop paying for it.
+
+Manual commands:
+
+```bash
+gcloud run services describe catoconsting --region us-central1 --format='value(status.url)'
+gcloud run services logs read catoconsting --region us-central1 --limit 50
+gcloud run revisions list --service catoconsting --region us-central1
+gcloud run services update-traffic catoconsting --region us-central1 --to-revisions=REVISION=100   # roll back
+```
+
+---
+
+## 7. Keeping costs down
 
 - **Stop VMs and Workbench instances when idle.** You only pay for disk while they're stopped. Workbench's `idle-timeout-seconds` does this automatically.
 - **Use Spot VMs** for interruptible batch work: add `--provisioning-model=SPOT` to `gcloud compute instances create`.
 - **Check BigQuery bytes before running a query:** `bq query --dry_run --use_legacy_sql=false '...'`. Select only the columns you need, and partition big tables by date.
+- **Cloud Run scales to zero** by default, so an idle service costs nothing. Avoid setting `--min-instances` above 0 unless you need to avoid cold starts.
 - **Cloud SQL bills while running.** Stop it when unused: `gcloud sql instances patch datasci-db --activation-policy=NEVER`.
 - **Set lifecycle rules** on buckets to move old data to cheaper storage classes.
 - Estimate first with the [GCP Pricing Calculator](https://cloud.google.com/products/calculator).
