@@ -4,17 +4,21 @@
 .DESCRIPTION
     Sets up a Windows Server VM for deploying the Catoconsting Java web application including:
     - Java JDK 17 (Microsoft distribution) for running the application
-    - IIS Web Server with URL Rewrite and ARR (Application Request Routing)
+    - IIS Web Server with URL Rewrite
     - Firewall rules for web traffic
     - Application deployment directory structure
     - Windows Service configuration for Java application
     - Monitoring and logging setup
+
+    Safe to run again: steps that are already done are skipped, generated
+    helper files are only rewritten when their content changes (the old copy is
+    kept as .bak), and the script exits with code 1 if any step failed.
 .PARAMETER ComputerName
     Name identifier for this server
 .PARAMETER LogFile
-    Path to the log file
+    Path to the log file (defaults to a timestamped file next to this script)
 #>
-
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive setup script')]
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
@@ -28,9 +32,13 @@ $ErrorActionPreference = "Continue"
 
 # Import common module
 Import-Module "$PSScriptRoot\lib\common.psm1" -Force
+if (-not $LogFile) {
+    $LogFile = Join-Path $PSScriptRoot "setup-log-$ComputerName-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+}
+Set-LogFile -Path $LogFile
 
 # Check if running as Administrator
-Require-Administrator
+Assert-Administrator
 
 # Check if running on Windows Server
 $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem
@@ -60,35 +68,48 @@ Install-JavaJDK17
 Set-JavaHome
 
 # Step 3: Install IIS Web Server and components
+# Every feature is requested on every run: Install-WindowsFeature skips the
+# ones already present, so a partly finished earlier run gets completed.
 Write-Log "Checking for IIS..."
-$iisFeature = Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue
-if ($iisFeature) {
-    if ($iisFeature.Installed) {
-        Write-Log "IIS is already installed" "SUCCESS"
-    } else {
-        Write-Log "Installing IIS Web Server..."
-        try {
-            Install-WindowsFeature -Name Web-Server -IncludeManagementTools
-            Install-WindowsFeature -Name Web-Asp-Net45
-            Install-WindowsFeature -Name Web-Net-Ext45
-            Install-WindowsFeature -Name Web-ISAPI-Ext
-            Install-WindowsFeature -Name Web-ISAPI-Filter
+$iisInstalled = $false
+$iisFeatures = @('Web-Server', 'Web-Asp-Net45', 'Web-Net-Ext45', 'Web-ISAPI-Ext', 'Web-ISAPI-Filter')
+if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+    try {
+        $missing = @(Get-WindowsFeature -Name $iisFeatures | Where-Object { -not $_.Installed } | ForEach-Object { $_.Name })
+        if ($missing.Count -eq 0) {
+            Write-Log "IIS and all required features are already installed" "SUCCESS"
+        } else {
+            Write-Log "Installing IIS features: $($missing -join ', ')..."
+            $result = Install-WindowsFeature -Name $iisFeatures -IncludeManagementTools -ErrorAction Stop
+            if (-not $result.Success) {
+                throw "Install-WindowsFeature reported failure (exit code $($result.ExitCode))"
+            }
+            if ($result.RestartNeeded -eq 'Yes') {
+                Write-Log "IIS installed but Windows needs a restart to finish" "WARNING"
+            }
             Write-Log "IIS installed successfully" "SUCCESS"
-        } catch {
-            Write-Log "Failed to install IIS: $($_.Exception.Message)" "ERROR"
         }
+        $iisInstalled = $true
+    } catch {
+        Write-Log "Failed to install IIS: $($_.Exception.Message)" "ERROR"
     }
 } else {
-    Write-Log "IIS features not available on this system (may not be Windows Server)" "WARNING"
+    Write-Log "IIS features not available on this system (Install-WindowsFeature needs Windows Server)" "WARNING"
 }
 
 # Step 4: Install URL Rewrite Module for IIS (useful for reverse proxy)
-Write-Log "Installing IIS URL Rewrite Module..."
-try {
-    choco install urlrewrite -y
-    Write-Log "URL Rewrite module installed" "SUCCESS"
-} catch {
-    Write-Log "Failed to install URL Rewrite: $($_.Exception.Message)" "WARNING"
+Write-Log "Checking for IIS URL Rewrite Module..."
+if (-not $iisInstalled) {
+    Write-Log "Skipping URL Rewrite: IIS is not installed" "WARNING"
+} elseif (Test-ChocoPackage -Package urlrewrite) {
+    Write-Log "URL Rewrite module is already installed" "SUCCESS"
+} else {
+    try {
+        Invoke-ChocoInstall -Package urlrewrite
+        Write-Log "URL Rewrite module installed" "SUCCESS"
+    } catch {
+        Write-Log "Failed to install URL Rewrite: $($_.Exception.Message)" "WARNING"
+    }
 }
 
 # Step 5: Create application directory structure
@@ -103,10 +124,11 @@ try {
         }
     }
 
-    # Set appropriate permissions
+    # Set appropriate permissions (by SID so it works on non-English Windows)
+    $networkService = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-20")
     $acl = Get-Acl $AppDir
     $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        "NETWORK SERVICE", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+        $networkService, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
     )
     $acl.SetAccessRule($accessRule)
     Set-Acl $AppDir $acl
@@ -169,7 +191,7 @@ try {
 Write-Log "Installing NSSM (Service Manager)..."
 try {
     if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
-        choco install nssm -y
+        Invoke-ChocoInstall -Package nssm
         Write-Log "NSSM installed successfully" "SUCCESS"
 
         # Refresh environment
@@ -178,7 +200,7 @@ try {
         Write-Log "NSSM is already installed" "SUCCESS"
     }
 } catch {
-    Write-Log "Failed to install NSSM: $($_.Exception.Message)" "WARNING"
+    Write-Log "Failed to install NSSM: $($_.Exception.Message)" "ERROR"
 }
 
 # Step 8: Create deployment script
@@ -229,8 +251,7 @@ if ($service) {
 }
 '@
 
-Set-Content -Path $deployScriptPath -Value $deployScript
-Write-Log "Deployment script created" "SUCCESS"
+Set-FileIfChanged -Path $deployScriptPath -Value $deployScript
 
 # Step 9: Create service setup script
 $serviceScriptPath = Join-Path $AppDir "setup-service.ps1"
@@ -252,30 +273,55 @@ if (-not (Test-Path $JarFile)) {
     exit 1
 }
 
-# Check if Java is available
-if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
-    Write-Error "Java is not installed or not in PATH"
+# Find java.exe: the service does not inherit this console's PATH
+$javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+$JavaExe = if ($javaHome) { Join-Path $javaHome "bin\java.exe" } else { $null }
+if (-not $JavaExe -or -not (Test-Path $JavaExe)) {
+    $JavaExe = (Get-Command java -ErrorAction SilentlyContinue).Source
+}
+if (-not $JavaExe) {
+    Write-Error "Java is not installed (set JAVA_HOME or add java to PATH)"
     exit 1
 }
 
-# Remove existing service if it exists
+# Run an nssm command and stop if it fails
+function Invoke-Nssm {
+    & nssm @args
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "nssm $($args -join ' ') failed with exit code $LASTEXITCODE"
+        exit 1
+    }
+}
+
+# Remove existing service if it exists. Stop it first: removing a running
+# service only marks it for deletion and the install below would then fail.
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existingService) {
     Write-Host "Removing existing service..."
-    nssm remove $ServiceName confirm
+    if ($existingService.Status -ne 'Stopped') {
+        Stop-Service -Name $ServiceName -Force
+    }
+    Invoke-Nssm remove $ServiceName confirm
+    for ($i = 0; $i -lt 30 -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue); $i++) {
+        Start-Sleep -Seconds 1
+    }
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Error "Service $ServiceName is still being removed; close any Services windows and run this script again"
+        exit 1
+    }
 }
 
 # Create new service
 Write-Host "Creating Windows Service: $ServiceName..."
-nssm install $ServiceName java "-jar `"$JarFile`""
-nssm set $ServiceName AppDirectory $AppDir
-nssm set $ServiceName DisplayName "Catoconsting Web Application"
-nssm set $ServiceName Description "Java web application for Catoconsting project"
-nssm set $ServiceName Start SERVICE_AUTO_START
-nssm set $ServiceName AppStdout (Join-Path $LogDir "service-stdout.log")
-nssm set $ServiceName AppStderr (Join-Path $LogDir "service-stderr.log")
-nssm set $ServiceName AppRotateFiles 1
-nssm set $ServiceName AppRotateBytes 10485760  # 10 MB
+Invoke-Nssm install $ServiceName $JavaExe "-jar `"$JarFile`""
+Invoke-Nssm set $ServiceName AppDirectory $AppDir
+Invoke-Nssm set $ServiceName DisplayName "Catoconsting Web Application"
+Invoke-Nssm set $ServiceName Description "Java web application for Catoconsting project"
+Invoke-Nssm set $ServiceName Start SERVICE_AUTO_START
+Invoke-Nssm set $ServiceName AppStdout (Join-Path $LogDir "service-stdout.log")
+Invoke-Nssm set $ServiceName AppStderr (Join-Path $LogDir "service-stderr.log")
+Invoke-Nssm set $ServiceName AppRotateFiles 1
+Invoke-Nssm set $ServiceName AppRotateBytes 10485760  # 10 MB
 
 Write-Host "Service created successfully!"
 Write-Host "Starting service..."
@@ -288,8 +334,7 @@ Write-Host "`nService configured successfully!"
 Write-Host "Logs location: $LogDir"
 '@
 
-Set-Content -Path $serviceScriptPath -Value $serviceScript
-Write-Log "Service setup script created" "SUCCESS"
+Set-FileIfChanged -Path $serviceScriptPath -Value $serviceScript
 
 # Step 10: Create application configuration template
 $configTemplatePath = Join-Path $ConfigDir "application.properties.template"
@@ -315,8 +360,7 @@ spring.application.name=Catoconsting
 # Add your application-specific configuration below
 '@
 
-Set-Content -Path $configTemplatePath -Value $configTemplate
-Write-Log "Configuration template created" "SUCCESS"
+Set-FileIfChanged -Path $configTemplatePath -Value $configTemplate
 
 # Step 11: Create README for server operations
 $readmePath = Join-Path $AppDir "README.txt"
@@ -379,17 +423,20 @@ Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 ====================================================
 "@
 
-Set-Content -Path $readmePath -Value $readmeContent
-Write-Log "Operations README created" "SUCCESS"
+Set-FileIfChanged -Path $readmePath -Value $readmeContent -IgnorePattern '^Generated: '
 
 # Step 12: Verify installations
 Write-Log "`n=== Verification of Installed Components ===" "INFO"
 Write-Log "Verifying Java..."
-try {
-    $javaCheck = & java -version 2>&1 | Out-String
-    Write-Log "Java: OK" "SUCCESS"
-} catch {
-    Write-Log "Java: FAILED" "ERROR"
+if (Get-Command java -ErrorAction SilentlyContinue) {
+    & java -version 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Log "Java: OK" "SUCCESS"
+    } else {
+        Write-Log "Java: FAILED (exit code $LASTEXITCODE)" "ERROR"
+    }
+} else {
+    Write-Log "Java: not found on PATH" "ERROR"
 }
 
 Write-Log "Verifying IIS..."
@@ -401,23 +448,33 @@ try {
 }
 
 Write-Log "Verifying NSSM..."
-try {
-    $nssmCheck = Get-Command nssm -ErrorAction Stop
+if (Get-Command nssm -ErrorAction SilentlyContinue) {
     Write-Log "NSSM: OK" "SUCCESS"
-} catch {
-    Write-Log "NSSM: FAILED" "WARNING"
+} else {
+    Write-Log "NSSM: not found on PATH" "WARNING"
 }
 
 # Summary
-Write-Host "`n================================================" -ForegroundColor Green
-Write-Host "   Windows Server Setup Complete!" -ForegroundColor Green
-Write-Host "================================================" -ForegroundColor Green
+$failures = Get-SetupFailure
+$color = if ($failures) { "Yellow" } else { "Green" }
+Write-Host "`n================================================" -ForegroundColor $color
+if ($failures) {
+    Write-Host "   Windows Server Setup Finished With Errors" -ForegroundColor $color
+} else {
+    Write-Host "   Windows Server Setup Complete!" -ForegroundColor $color
+}
+Write-Host "================================================" -ForegroundColor $color
 Write-Host "Server Configuration:" -ForegroundColor Cyan
 Write-Host "  - Java JDK 17 (Microsoft OpenJDK)" -ForegroundColor White
 Write-Host "  - IIS Web Server" -ForegroundColor White
 Write-Host "  - URL Rewrite Module" -ForegroundColor White
 Write-Host "  - NSSM Service Manager" -ForegroundColor White
 Write-Host "  - Firewall rules configured" -ForegroundColor White
+if ($failures) {
+    Write-Host "`nFailed steps:" -ForegroundColor Red
+    $failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    Write-Host "Fix the problems above and run the script again; finished steps are skipped." -ForegroundColor Yellow
+}
 Write-Host "`nApplication Directory: $AppDir" -ForegroundColor Yellow
 Write-Host "`nDeployment Scripts Created:" -ForegroundColor Cyan
 Write-Host "  - $deployScriptPath" -ForegroundColor White
@@ -427,8 +484,14 @@ Write-Host "  1. Deploy your JAR file using: .\deploy.ps1 -JarPath <path-to-jar>
 Write-Host "  2. Set up Windows Service: .\setup-service.ps1" -ForegroundColor White
 Write-Host "  3. Configure application properties in: $ConfigDir" -ForegroundColor White
 Write-Host "  4. Monitor logs in: $LogDir" -ForegroundColor White
-Write-Host "  5. Access application at: http://$ComputerName:8080" -ForegroundColor White
+Write-Host "  5. Access application at: http://${ComputerName}:8080" -ForegroundColor White
 Write-Host "`nRefer to: $readmePath for operational guide" -ForegroundColor Yellow
-Write-Host "================================================`n" -ForegroundColor Green
+Write-Host "Log File: $LogFile" -ForegroundColor Yellow
+Write-Host "================================================`n" -ForegroundColor $color
 
+if ($failures) {
+    Write-Log "=== Windows Server VM Setup Finished With $($failures.Count) Failed Step(s) ===" "WARNING"
+    exit 1
+}
 Write-Log "=== Windows Server VM Setup Completed ===" "SUCCESS"
+exit 0
