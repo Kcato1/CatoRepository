@@ -8,11 +8,22 @@
     The environment type: 'Desktop' or 'Server'
 .PARAMETER ComputerName
     Optional name to identify this computer (e.g., 'Desktop-1', 'Desktop-2', 'Server-VM')
+.PARAMETER GitUserName
+    Desktop only: Git user.name to configure instead of prompting
+.PARAMETER GitUserEmail
+    Desktop only: Git user.email to configure instead of prompting
+.PARAMETER RepoUrl
+    Desktop only: repository to clone into the workspace instead of prompting
+.PARAMETER NonInteractive
+    Desktop only: never prompt; steps with missing values are skipped
 .EXAMPLE
     .\setup-environment.ps1 -Environment Desktop -ComputerName "Desktop-1"
 .EXAMPLE
     .\setup-environment.ps1 -Environment Server -ComputerName "Server-VM"
+.EXAMPLE
+    .\setup-environment.ps1 -Environment Desktop -NonInteractive -GitUserName "Jane Doe" -GitUserEmail "jane@example.com"
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive setup script')]
 
 [CmdletBinding()]
 param(
@@ -21,7 +32,12 @@ param(
     [string]$Environment,
 
     [Parameter(Mandatory=$false)]
-    [string]$ComputerName = $env:COMPUTERNAME
+    [string]$ComputerName = $env:COMPUTERNAME,
+
+    [string]$GitUserName,
+    [string]$GitUserEmail,
+    [string]$RepoUrl,
+    [switch]$NonInteractive
 )
 
 # Script configuration
@@ -31,9 +47,7 @@ $LogFile = Join-Path $ScriptRoot "setup-log-$ComputerName-$(Get-Date -Format 'yy
 
 # Import common module
 Import-Module "$PSScriptRoot\lib\common.psm1" -Force
-
-# Require Administrator
-Require-Administrator
+Set-LogFile -Path $LogFile
 
 # Banner
 function Show-Banner {
@@ -48,6 +62,9 @@ function Show-Banner {
 
 # Main execution
 try {
+    # Require Administrator
+    Assert-Administrator
+
     Show-Banner
     Write-Log "Starting setup for $Environment environment on $ComputerName"
 
@@ -65,7 +82,16 @@ try {
     Write-Log "Executing setup script: $setupScript"
 
     # Execute the appropriate setup script
-    & $setupScript -ComputerName $ComputerName -LogFile $LogFile
+    $setupArgs = @{ ComputerName = $ComputerName; LogFile = $LogFile }
+    if ($Environment -eq 'Desktop') {
+        foreach ($name in 'GitUserName', 'GitUserEmail', 'RepoUrl', 'NonInteractive') {
+            if ($PSBoundParameters.ContainsKey($name)) { $setupArgs[$name] = $PSBoundParameters[$name] }
+        }
+    }
+    & $setupScript @setupArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Environment setup reported failed steps (exit code $LASTEXITCODE)"
+    }
 
     Write-Log "Setup completed successfully!" "SUCCESS"
     Write-Host "`n================================================" -ForegroundColor Green

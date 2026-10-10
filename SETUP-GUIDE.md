@@ -543,14 +543,23 @@ sudo systemctl restart nginx
 **Parameters:**
 - `-Environment` (Required) - Type of environment: `Desktop` or `Server`
 - `-ComputerName` (Optional) - Identifier for the computer (defaults to hostname)
+- `-GitUserName`, `-GitUserEmail` (Optional, Desktop) - Git identity to configure instead of prompting
+- `-RepoUrl` (Optional, Desktop) - Repository to clone into `%USERPROFILE%\CatoWorkspace` instead of prompting
+- `-NonInteractive` (Optional, Desktop) - Never prompt; steps without a value are skipped
 
 **Example:**
 ```powershell
 .\setup-environment.ps1 -Environment Desktop -ComputerName "Dev-PC-01"
+
+# Unattended rerun
+.\setup-environment.ps1 -Environment Desktop -NonInteractive -GitUserName "Jane Doe" -GitUserEmail "jane@example.com"
 ```
 
 **Output:**
 - Log file: `setup-log-<ComputerName>-<timestamp>.txt`
+- Exit code `1` if any step failed; the failed steps are listed at the end
+
+**Running it again:** steps that are already done are skipped, so the script is safe to rerun after fixing a failure. On a server, generated files in `C:\Apps\Catoconsting` are only rewritten when their content changes, and the previous copy is kept as `.bak`.
 
 ### setup-desktop.ps1
 
@@ -562,7 +571,7 @@ Called automatically by `setup-environment.ps1` when `-Environment Desktop` is s
 - Installs development tools
 - Configures Git
 - Creates workspace directory
-- Interactive prompts for Git configuration and repository cloning
+- Prompts for Git configuration and repository cloning (skip with `-GitUserName`, `-GitUserEmail`, `-RepoUrl` or `-NonInteractive`)
 
 ### setup-server.ps1
 
