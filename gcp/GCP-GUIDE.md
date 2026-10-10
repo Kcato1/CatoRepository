@@ -41,7 +41,7 @@ Full control, same workflow as a local Linux box. Two scripts:
 
 | Script | Where to run | What it does |
 |---|---|---|
-| `gcp/create-vm.sh` | Your PC (Git Bash) or Cloud Shell | Enables APIs, adds an IAP-only SSH firewall rule, creates an Ubuntu 24.04 VM, copies the setup files over |
+| `gcp/create-vm.sh` | Your PC (Git Bash) or Cloud Shell | Enables APIs, adds firewall rules so SSH only works through IAP, creates an Ubuntu 24.04 VM, copies the setup files over |
 | `gcp/setup-gcp-datasci.sh` | On the VM | Installs Python venv, Jupyter, pandas/sklearn/etc., GCP client libraries, dbt-bigquery, optional TensorFlow/PyTorch |
 
 ### Create and set up
@@ -223,8 +223,8 @@ gcloud storage rsync -r "C:/Users/<you>/DataScience/datasets" gs://my-datasci-pr
 
 ```bash
 bq mk --location=US analytics
-bq load --autodetect --source_format=CSV analytics.sales gs://my-datasci-proj-data/datasets/sales.csv
-bq load --source_format=PARQUET analytics.events "gs://my-datasci-proj-data/datasets/events/*.parquet"
+bq load --replace --autodetect --source_format=CSV analytics.sales gs://my-datasci-proj-data/datasets/sales.csv
+bq load --replace --source_format=PARQUET analytics.events "gs://my-datasci-proj-data/datasets/events/*.parquet"
 ```
 
 ### Step 3: Move PostgreSQL to Cloud SQL (if you need a transactional database)
@@ -302,7 +302,7 @@ gcloud storage cp -r gs://my-datasci-proj-data/notebooks ~/DataScience/
 3. Pushes the image to Artifact Registry, tagged with the commit SHA
 4. Deploys the `catoconsting` Cloud Run service and prints its URL in the run summary
 
-GitHub authenticates to GCP with **Workload Identity Federation**, so no service-account key is stored in GitHub. Only runs from `main` of this repository are accepted.
+GitHub authenticates to GCP with **Workload Identity Federation**, so no service-account key is stored in GitHub. Only runs from `main` of this repository are accepted. The deployer can only deploy new revisions of the `catoconsting` service; it can't touch other services or change who may call it.
 
 ### One-time setup
 
@@ -310,7 +310,7 @@ GitHub authenticates to GCP with **Workload Identity Federation**, so no service
 bash gcp/setup-cloud-run-cicd.sh my-datasci-proj us-central1
 ```
 
-This creates the Artifact Registry repo, a deployer and a runtime service account, and the federation provider, then prints five `gh variable set` commands. Run them (or add the values under **Settings → Secrets and variables → Actions → Variables**):
+This creates the Artifact Registry repo, a deployer and a runtime service account, the `catoconsting` service (running Google's placeholder "hello" image until your first deploy), and the federation provider, then prints five `gh variable set` commands. Run them (or add the values under **Settings → Secrets and variables → Actions → Variables**):
 
 | Variable | Example |
 |---|---|
@@ -325,7 +325,7 @@ Then trigger it from **Actions → Build and deploy to Cloud Run - Catoconsting 
 ### Notes
 
 - **The repo must contain the app source.** The workflow runs `mvn package` at the repo root, so it needs `pom.xml` and `src/` committed here, the same as the Azure workflow did.
-- **Public access:** the service is deployed with `--allow-unauthenticated`, like the Azure Web App. Remove that flag from the workflow to require IAM auth. If your organization blocks public services (domain-restricted sharing), the deploy step will fail on that flag.
+- **Public access:** the setup script makes the service public, like the Azure Web App, by granting `roles/run.invoker` to `allUsers`. If your organization blocks that (domain-restricted sharing), the script warns and the service requires authenticated requests. To make it private later: `gcloud run services remove-iam-policy-binding catoconsting --region REGION --member=allUsers --role=roles/run.invoker`.
 - **App config:** add environment variables or secrets with the `env_vars` / `secrets` inputs of the `deploy-cloudrun` step. Grant any GCP roles the app needs (Cloud SQL, Storage, ...) to the runtime service account, not the deployer.
 - **Port:** the container passes `-Dserver.port=$PORT`, which Spring Boot honors. A non-Spring app should read the `PORT` environment variable.
 - **Retiring Azure:** once Cloud Run is serving, delete the `AZUREAPPSERVICE_PUBLISHPROFILE_...` repository secret and the Azure Web App so you stop paying for it.

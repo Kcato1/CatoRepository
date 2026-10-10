@@ -1,6 +1,7 @@
 """Train and evaluate a model inside BigQuery with SQL (BigQuery ML) — no data leaves BigQuery.
 
 Uses the public penguins dataset; creates <dataset>.penguin_classifier in your project.
+The dataset is created in the US multi-region because the source data lives there.
 
 python bigquery_ml_example.py --project my-project
 """
@@ -17,12 +18,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
     parser.add_argument("--dataset", default="sandbox")
-    parser.add_argument("--location", default="US")
     args = parser.parse_args()
 
     client = bigquery.Client(project=args.project)
     dataset = bigquery.Dataset(f"{args.project}.{args.dataset}")
-    dataset.location = args.location
+    dataset.location = "US"
     client.create_dataset(dataset, exists_ok=True)
     model = f"`{args.project}.{args.dataset}.penguin_classifier`"
 

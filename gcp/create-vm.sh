@@ -30,17 +30,35 @@ gcloud services enable \
     aiplatform.googleapis.com \
     iap.googleapis.com
 
-# Allow SSH only from Google's IAP range, so the VM needs no public SSH exposure.
-if ! gcloud compute firewall-rules describe allow-iap-ssh >/dev/null 2>&1; then
-    gcloud compute firewall-rules create allow-iap-ssh \
+# SSH only via IAP. The default network's default-allow-ssh (priority 65534) opens port 22 to the
+# internet, so tagged VMs get an IAP allow (900) and an explicit deny (1000) that both outrank it.
+NETWORK_TAG=datasci-iap-ssh
+if ! gcloud compute firewall-rules describe datasci-allow-iap-ssh >/dev/null 2>&1; then
+    gcloud compute firewall-rules create datasci-allow-iap-ssh \
         --network=default \
-        --allow=tcp:22 \
+        --direction=INGRESS \
+        --action=ALLOW \
+        --rules=tcp:22 \
         --source-ranges=35.235.240.0/20 \
+        --target-tags="$NETWORK_TAG" \
+        --priority=900 \
         --description="SSH via Identity-Aware Proxy"
+fi
+if ! gcloud compute firewall-rules describe datasci-deny-public-ssh >/dev/null 2>&1; then
+    gcloud compute firewall-rules create datasci-deny-public-ssh \
+        --network=default \
+        --direction=INGRESS \
+        --action=DENY \
+        --rules=tcp:22 \
+        --source-ranges=0.0.0.0/0 \
+        --target-tags="$NETWORK_TAG" \
+        --priority=1000 \
+        --description="Block SSH from anywhere except IAP"
 fi
 
 if gcloud compute instances describe "$VM_NAME" --zone "$ZONE" >/dev/null 2>&1; then
-    echo "VM $VM_NAME already exists; skipping creation."
+    echo "VM $VM_NAME already exists; making sure it has the IAP-only SSH tag."
+    gcloud compute instances add-tags "$VM_NAME" --zone "$ZONE" --tags="$NETWORK_TAG"
 else
     gcloud compute instances create "$VM_NAME" \
         --zone="$ZONE" \
@@ -50,6 +68,7 @@ else
         --boot-disk-size="$DISK_SIZE" \
         --boot-disk-type=pd-balanced \
         --scopes=cloud-platform \
+        --tags="$NETWORK_TAG" \
         --shielded-secure-boot
 fi
 
