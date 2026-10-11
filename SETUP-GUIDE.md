@@ -239,7 +239,7 @@ The server setup script (`setup-server.ps1`) installs and configures:
 3. **IIS Web Server** - With ASP.NET and ISAPI components
 4. **URL Rewrite Module** - For IIS reverse proxy capabilities
 5. **NSSM** - Service manager to run Java app as Windows Service
-6. **Firewall Rules** - For HTTP (80), HTTPS (443), and Java app (8080)
+6. **Firewall Rules** - For HTTP (80) and HTTPS (443) on all networks, and the Java app (8080) on Domain and Private networks only (change with `-AppPortProfile`)
 
 ### Directory Structure Created
 
@@ -284,7 +284,7 @@ After server setup, follow these steps to deploy your application:
 
 6. **Access your application:**
    - Local: `http://localhost:8080`
-   - Remote: `http://<server-ip>:8080`
+   - Remote: `http://<server-ip>:8080` (port 8080 is closed on Public networks unless setup ran with `-AppPortProfile Any`)
 
 ### Service Management
 
@@ -546,6 +546,7 @@ sudo systemctl restart nginx
 - `-GitUserName`, `-GitUserEmail` (Optional, Desktop) - Git identity to configure instead of prompting
 - `-RepoUrl` (Optional, Desktop) - Repository to clone into `%USERPROFILE%\CatoWorkspace` instead of prompting
 - `-NonInteractive` (Optional, Desktop) - Never prompt; steps without a value are skipped
+- `-AppPortProfile` (Optional, Server) - Firewall profiles that may reach the Java app on port 8080: `Domain`, `Private`, `Public` or `Any` (default `Domain`, `Private`)
 
 **Example:**
 ```powershell
@@ -572,6 +573,19 @@ Called automatically by `setup-environment.ps1` when `-Environment Desktop` is s
 - Configures Git
 - Creates workspace directory
 - Prompts for Git configuration and repository cloning (skip with `-GitUserName`, `-GitUserEmail`, `-RepoUrl` or `-NonInteractive`)
+- Runs the per-user steps through `setup-desktop-user.ps1` when the elevated account is the signed-in user
+
+### setup-desktop-user.ps1
+
+**Per-user part of the desktop setup.** Installs the VS Code Java extensions, sets Git `user.name` and `user.email`, creates `%USERPROFILE%\CatoWorkspace` and clones the repository, all for the account that runs it.
+
+`setup-desktop.ps1` runs it automatically when the elevated window belongs to the signed-in user. If you elevate with a separate admin account, those steps are skipped and the summary tells you to run this script yourself, as the developer, in a normal (non-admin) PowerShell window:
+
+```powershell
+.\setup-desktop-user.ps1 -GitUserName "Jane Doe" -GitUserEmail "jane@example.com"
+```
+
+Takes the same `-GitUserName`, `-GitUserEmail`, `-RepoUrl` and `-NonInteractive` parameters, and exits with code `1` if a step failed.
 
 ### setup-server.ps1
 
@@ -582,8 +596,8 @@ Called automatically by `setup-environment.ps1` when `-Environment Server` is sp
 **Features:**
 - Installs server components
 - Configures IIS
-- Sets up firewall rules
-- Creates deployment scripts
+- Sets up firewall rules, and corrects existing ones whose port or profile has drifted
+- Creates deployment scripts, including `setup-service.ps1`, which runs the app as a Windows service under NETWORK SERVICE
 - Prepares application directory structure
 
 ### setup-environment.sh
