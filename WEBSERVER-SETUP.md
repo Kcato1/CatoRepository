@@ -16,7 +16,8 @@ These scripts install Node.js and the `http-server` package, which provides a si
 ### Windows
 
 ```powershell
-# Run as Administrator
+# First run: as Administrator if Node.js is not installed yet
+# (http-server itself is installed for whoever runs the script)
 .\setup-webserver.ps1
 
 # Or install and start immediately
@@ -53,21 +54,22 @@ chmod +x setup-webserver.sh
    - Zero-configuration
    - Supports various options (CORS, caching, gzip, etc.)
 
-3. **Wrapper Script** (`start-webserver.ps1` or `start-webserver.sh`)
+3. **Wrapper Script** (`start-webserver.ps1`, included in the repository, or `start-webserver.sh`)
    - Convenience script for starting the server
    - Simplifies common usage patterns
+   - On Windows, listens on `127.0.0.1` (this computer only) unless you pass `-Address 0.0.0.0`
 
 ## Installation Details
 
 ### Windows Installation
 
 The PowerShell script:
-- Requires Administrator privileges
+- Needs Administrator privileges only when Node.js is not installed yet
 - Installs Chocolatey (if not present)
 - Installs Node.js LTS via Chocolatey
-- Installs http-server globally via npm
-- Creates a convenience wrapper script
-- Optionally starts the server
+- Installs http-server globally via npm, for the account running the script
+- Optionally starts the server through `start-webserver.ps1`
+- Exits with code `1` if a step failed; safe to run again
 
 ### Linux/macOS Installation
 
@@ -101,6 +103,9 @@ After installation, you can use the convenient wrapper script:
 
 # Specify directory
 .\start-webserver.ps1 -Directory "C:\path\to\files" -Port 8080
+
+# Share on the local network (listens on every network, not just this computer)
+.\start-webserver.ps1 -Address 0.0.0.0
 ```
 
 #### Linux/macOS
@@ -337,9 +342,12 @@ ifconfig | grep "inet "
 ip addr show
 ```
 
-2. Start server:
+2. Start server, listening on every network:
 ```bash
-http-server -p 8080
+http-server -a 0.0.0.0 -p 8080
+
+# Windows wrapper script
+.\start-webserver.ps1 -Address 0.0.0.0
 ```
 
 3. Access from another device:
