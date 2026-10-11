@@ -23,7 +23,10 @@ GITHUB_REPO_ID="920805771"
 gcloud config set project "$PROJECT_ID" >/dev/null
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
 
-sa_email() { echo "$1@$PROJECT_ID.iam.gserviceaccount.com"; }
+sa_email() {
+    local name=$1
+    echo "$name@$PROJECT_ID.iam.gserviceaccount.com"
+}
 
 ensure_ar_repo() {
     local repo=$1
@@ -34,8 +37,9 @@ ensure_ar_repo() {
 }
 
 ensure_sa() {
-    if ! gcloud iam service-accounts describe "$(sa_email "$1")" >/dev/null 2>&1; then
-        gcloud iam service-accounts create "$1" --display-name="$1"
+    local name=$1
+    if ! gcloud iam service-accounts describe "$(sa_email "$name")" >/dev/null 2>&1; then
+        gcloud iam service-accounts create "$name" --display-name="$name"
     fi
 }
 
