@@ -16,6 +16,9 @@
     Desktop only: repository to clone into the workspace instead of prompting
 .PARAMETER NonInteractive
     Desktop only: never prompt; steps with missing values are skipped
+.PARAMETER AppPortProfile
+    Server only: firewall profiles that may reach the Java app on port 8080
+    (default Domain and Private; use Any to also allow Public networks)
 .EXAMPLE
     .\setup-environment.ps1 -Environment Desktop -ComputerName "Desktop-1"
 .EXAMPLE
@@ -37,7 +40,10 @@ param(
     [string]$GitUserName,
     [string]$GitUserEmail,
     [string]$RepoUrl,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+
+    [ValidateSet('Any', 'Domain', 'Private', 'Public')]
+    [string[]]$AppPortProfile
 )
 
 # Script configuration
@@ -83,10 +89,12 @@ try {
 
     # Execute the appropriate setup script
     $setupArgs = @{ ComputerName = $ComputerName; LogFile = $LogFile }
-    if ($Environment -eq 'Desktop') {
-        foreach ($name in 'GitUserName', 'GitUserEmail', 'RepoUrl', 'NonInteractive') {
-            if ($PSBoundParameters.ContainsKey($name)) { $setupArgs[$name] = $PSBoundParameters[$name] }
-        }
+    $passThrough = switch ($Environment) {
+        'Desktop' { 'GitUserName', 'GitUserEmail', 'RepoUrl', 'NonInteractive' }
+        'Server'  { 'AppPortProfile' }
+    }
+    foreach ($name in $passThrough) {
+        if ($PSBoundParameters.ContainsKey($name)) { $setupArgs[$name] = $PSBoundParameters[$name] }
     }
     & $setupScript @setupArgs
     if ($LASTEXITCODE -ne 0) {

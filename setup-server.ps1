@@ -17,6 +17,9 @@
     Name identifier for this server
 .PARAMETER LogFile
     Path to the log file (defaults to a timestamped file next to this script)
+.PARAMETER AppPortProfile
+    Firewall profiles that may reach the Java app on port 8080. Defaults to
+    Domain and Private; use Any to also allow Public networks.
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive setup script')]
 [CmdletBinding()]
@@ -25,7 +28,10 @@ param(
     [string]$ComputerName = $env:COMPUTERNAME,
 
     [Parameter(Mandatory=$false)]
-    [string]$LogFile
+    [string]$LogFile,
+
+    [ValidateSet('Any', 'Domain', 'Private', 'Public')]
+    [string[]]$AppPortProfile = @('Domain', 'Private')
 )
 
 $ErrorActionPreference = "Continue"
@@ -139,50 +145,60 @@ try {
 }
 
 # Step 6: Configure Windows Firewall rules
+# Rules are matched by display name. A rule that already exists is corrected
+# if its port, protocol, profile or state no longer match what is set here.
+function Sync-CatoFirewallRule {
+    param([string]$Name, [int]$Port, [string[]]$NetworkProfile)
+    $rule = Get-NetFirewallRule -DisplayName $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $rule) {
+        New-NetFirewallRule -DisplayName $Name `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -Action Allow `
+            -Profile $NetworkProfile | Out-Null
+        Write-Log "Created firewall rule '$Name' (TCP $Port, profiles: $($NetworkProfile -join ', '))" "SUCCESS"
+        return
+    }
+
+    $portFilter = $rule | Get-NetFirewallPortFilter
+    $currentProfiles = ($rule.Profile.ToString() -split ',\s*' | Sort-Object) -join ','
+    $wantedProfiles = ($NetworkProfile | Sort-Object) -join ','
+    $isCorrect = "$($portFilter.LocalPort)" -eq "$Port" -and
+        "$($portFilter.Protocol)" -eq 'TCP' -and
+        "$($rule.Direction)" -eq 'Inbound' -and
+        "$($rule.Action)" -eq 'Allow' -and
+        "$($rule.Enabled)" -eq 'True' -and
+        $currentProfiles -eq $wantedProfiles
+    if ($isCorrect) {
+        Write-Log "Firewall rule '$Name' is already correct" "SUCCESS"
+    } else {
+        Set-NetFirewallRule -DisplayName $Name `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort $Port `
+            -Action Allow `
+            -Profile $NetworkProfile `
+            -Enabled True
+        Write-Log "Updated firewall rule '$Name' (TCP $Port, profiles: $($NetworkProfile -join ', '))" "SUCCESS"
+    }
+}
+
 Write-Log "Configuring firewall rules..."
 try {
-    # Allow HTTP traffic (port 80)
-    $httpRule = Get-NetFirewallRule -DisplayName "Catoconsting HTTP" -ErrorAction SilentlyContinue
-    if (-not $httpRule) {
-        New-NetFirewallRule -DisplayName "Catoconsting HTTP" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 80 `
-            -Action Allow `
-            -Profile Any | Out-Null
-        Write-Log "Created firewall rule for HTTP (port 80)" "SUCCESS"
-    } else {
-        Write-Log "Firewall rule for HTTP already exists" "SUCCESS"
-    }
+    # IIS serves HTTP and HTTPS to every network
+    Sync-CatoFirewallRule -Name "Catoconsting HTTP" -Port 80 -NetworkProfile Any
+    Sync-CatoFirewallRule -Name "Catoconsting HTTPS" -Port 443 -NetworkProfile Any
 
-    # Allow HTTPS traffic (port 443)
-    $httpsRule = Get-NetFirewallRule -DisplayName "Catoconsting HTTPS" -ErrorAction SilentlyContinue
-    if (-not $httpsRule) {
-        New-NetFirewallRule -DisplayName "Catoconsting HTTPS" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 443 `
-            -Action Allow `
-            -Profile Any | Out-Null
-        Write-Log "Created firewall rule for HTTPS (port 443)" "SUCCESS"
-    } else {
-        Write-Log "Firewall rule for HTTPS already exists" "SUCCESS"
-    }
+    # The Java app port is only opened to the networks in -AppPortProfile
+    Sync-CatoFirewallRule -Name "Catoconsting Java App" -Port 8080 -NetworkProfile $AppPortProfile
 
-    # Allow Java application port (8080) - typical for Spring Boot apps
-    $javaRule = Get-NetFirewallRule -DisplayName "Catoconsting Java App" -ErrorAction SilentlyContinue
-    if (-not $javaRule) {
-        New-NetFirewallRule -DisplayName "Catoconsting Java App" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 8080 `
-            -Action Allow `
-            -Profile Any | Out-Null
-        Write-Log "Created firewall rule for Java App (port 8080)" "SUCCESS"
-    } else {
-        Write-Log "Firewall rule for Java App already exists" "SUCCESS"
+    if ($AppPortProfile -notcontains 'Any' -and $AppPortProfile -notcontains 'Public') {
+        $publicNetworks = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { "$($_.NetworkCategory)" -eq 'Public' })
+        if ($publicNetworks.Count -gt 0) {
+            Write-Log "Port 8080 is closed on Public networks, and this server is on one ($($publicNetworks.Name -join ', ')). To reach the app on 8080 from other machines, rerun with -AppPortProfile Any or mark the network Private" "WARNING"
+        }
     }
-
 } catch {
     Write-Log "Failed to configure firewall rules: $($_.Exception.Message)" "ERROR"
 }
@@ -323,6 +339,19 @@ Invoke-Nssm set $ServiceName AppStderr (Join-Path $LogDir "service-stderr.log")
 Invoke-Nssm set $ServiceName AppRotateFiles 1
 Invoke-Nssm set $ServiceName AppRotateBytes 10485760  # 10 MB
 
+# Run as NETWORK SERVICE, the account granted access to the app folder, rather
+# than LocalSystem. Set through WMI because nssm needs an empty password
+# argument, which Windows PowerShell 5.1 does not pass to native programs.
+$serviceInfo = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'"
+$change = Invoke-CimMethod -InputObject $serviceInfo -MethodName Change -Arguments @{
+    StartName     = 'NT AUTHORITY\NetworkService'
+    StartPassword = ''
+}
+if ($change.ReturnValue -ne 0) {
+    Write-Error "Could not set $ServiceName to run as NETWORK SERVICE (Win32_Service.Change returned $($change.ReturnValue))"
+    exit 1
+}
+
 Write-Host "Service created successfully!"
 Write-Host "Starting service..."
 Start-Service -Name $ServiceName
@@ -402,7 +431,7 @@ FIREWALL RULES:
 ---------------
 HTTP (80):      Enabled
 HTTPS (443):    Enabled
-Java App (8080): Enabled
+Java App (8080): Enabled on $($AppPortProfile -join ', ') networks
 
 TROUBLESHOOTING:
 ----------------
