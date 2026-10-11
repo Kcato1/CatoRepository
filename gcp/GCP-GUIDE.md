@@ -295,38 +295,88 @@ gcloud storage cp -r gs://my-datasci-proj-data/notebooks ~/DataScience/
 
 ## 6. Deploying the Catoconsting app to Cloud Run
 
-`.github/workflows/deploy-cloud-run.yml` replaces the old Azure Web App workflow. On every push to `main` (or a manual run from the Actions tab) it:
+`.github/workflows/deploy-cloud-run.yml` replaces the old Azure Web App workflow.
 
-1. Builds the JAR with Maven on Java 17
-2. Packages it with the root `Dockerfile` (Temurin 17 JRE, runs as a non-root user, listens on Cloud Run's `PORT`)
-3. Pushes the image to Artifact Registry, tagged with the commit SHA
-4. Deploys the `catoconsting` Cloud Run service and prints its URL in the run summary
+| Event | What runs |
+|---|---|
+| Pull request (any) | Maven build, so build breaks show up before merge |
+| Pull request from a branch in this repo | Also deploys a **preview**: a no-traffic revision tagged `pr-<number>` on the separate `catoconsting-preview` service |
+| Pull request closed or merged | Removes that PR's preview tag |
+| Push to `main` (or a manual run on `main`) | Build, then waits for **your approval** in the `production` environment, then deploys `catoconsting` |
 
-GitHub authenticates to GCP with **Workload Identity Federation**, so no service-account key is stored in GitHub. Only runs from `main` of this repository are accepted. The deployer can only deploy new revisions of the `catoconsting` service; it can't touch other services or change who may call it.
+Each deploy packages the JAR with the root `Dockerfile` (Temurin 17 JRE, non-root, listens on Cloud Run's `PORT`), pushes it to Artifact Registry tagged with the commit SHA, and deploys a new revision.
+
+GitHub authenticates to GCP with **Workload Identity Federation**, so no service-account key is stored in GitHub:
+
+- **Production** credentials are only issued to jobs on `main` running in the `production` environment, so an approval is required to get them at all. The production deployer can only deploy revisions of `catoconsting`.
+- **Preview** credentials come from a separate pool and service account that can only touch `catoconsting-preview` and its own image repo. Preview code runs as its own runtime account, with its own variables and secrets, never production's.
+- Pull requests from forks get no GCP credentials. They only build.
 
 ### One-time setup
 
 ```bash
-bash gcp/setup-cloud-run-cicd.sh my-datasci-proj us-central1
+bash gcp/setup-cloud-run-cicd.sh my-datasci-proj us-central1   # GCP side, prints the next steps
+bash gcp/setup-github-environments.sh                           # production approval (needs repo admin)
 ```
 
-This creates the Artifact Registry repo, a deployer and a runtime service account, the `catoconsting` service (running Google's placeholder "hello" image until your first deploy), and the federation provider, then prints five `gh variable set` commands. Run them (or add the values under **Settings → Secrets and variables → Actions → Variables**):
+The first script creates both services (running Google's placeholder "hello" image until the first deploy), service accounts, image repos and federation providers. It then prints eight `gh variable set` commands; run them or add the values under **Settings → Secrets and variables → Actions → Variables**:
 
 | Variable | Example |
 |---|---|
 | `GCP_PROJECT_ID` | `my-datasci-proj` |
 | `GCP_REGION` | `us-central1` |
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/123456789/locations/global/workloadIdentityPools/github/providers/github-actions` |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/123456789/locations/global/workloadIdentityPools/catoconsting-github/providers/github-actions` |
 | `GCP_DEPLOY_SERVICE_ACCOUNT` | `catoconsting-deployer@my-datasci-proj.iam.gserviceaccount.com` |
 | `GCP_RUNTIME_SERVICE_ACCOUNT` | `catoconsting-runtime@my-datasci-proj.iam.gserviceaccount.com` |
+| `GCP_PREVIEW_WORKLOAD_IDENTITY_PROVIDER` | `projects/123456789/locations/global/workloadIdentityPools/catoconsting-github-preview/providers/github-pull-requests` |
+| `GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT` | `catoconsting-preview-deployer@my-datasci-proj.iam.gserviceaccount.com` |
+| `GCP_PREVIEW_RUNTIME_SERVICE_ACCOUNT` | `catoconsting-preview-runtime@my-datasci-proj.iam.gserviceaccount.com` |
 
-Then trigger it from **Actions → Build and deploy to Cloud Run - Catoconsting → Run workflow** on `main`.
+Previews are skipped until the `GCP_PREVIEW_*` variables are set, so you can turn them on later.
+
+The second script makes the `production` environment require approval from you (the logged-in `gh` user) and only accept deploys from `main`. **Run it before the first deploy:** if the workflow reaches the environment first, GitHub creates it without any approval rule. Add more reviewers under **Settings → Environments → production**.
+
+### Approving a deploy
+
+After a push to `main`, the run pauses at the `deploy` job. Open it from the **Actions** tab (or the email/notification GitHub sends) and choose **Review deployments → Approve and deploy**.
+
+### Environment variables and secrets
+
+Set these as GitHub variables (repository level, or on the `production` environment to override). Each holds one `KEY=VALUE` per line:
+
+| Variable | Used by | Example |
+|---|---|---|
+| `CLOUD_RUN_ENV_VARS` | production | `SPRING_PROFILES_ACTIVE=prod` |
+| `CLOUD_RUN_SECRETS` | production | `DB_PASSWORD=db-password:latest` |
+| `PREVIEW_ENV_VARS` | previews | `SPRING_PROFILES_ACTIVE=preview` |
+| `PREVIEW_SECRETS` | previews | `DB_PASSWORD=preview-db-password:latest` |
+
+Secrets are references to Secret Manager (`ENV_NAME=secret-name:version`); the values never pass through GitHub. Each runtime account can only read secrets you grant it:
+
+```bash
+printf '%s' "$VALUE" | gcloud secrets create db-password --data-file=-
+gcloud secrets add-iam-policy-binding db-password \
+    --member=serviceAccount:catoconsting-runtime@my-datasci-proj.iam.gserviceaccount.com \
+    --role=roles/secretmanager.secretAccessor
+```
+
+On each deploy the listed variables and secrets replace the service's previous ones, so removing a line removes it from the app. Deleting a GitHub variable entirely leaves the service's current values as they are.
+
+### Opening a preview
+
+The preview service is private, so its URL needs your Google login. The run summary prints the command; run it locally and open `http://localhost:8080`:
+
+```bash
+gcloud run services proxy catoconsting-preview --tag pr-12 --region us-central1
+```
+
+Preview images are deleted after 30 days, so a preview left untouched that long stops starting. Push to the PR to rebuild it.
 
 ### Notes
 
-- **The repo must contain the app source.** The workflow runs `mvn package` at the repo root, so it needs `pom.xml` and `src/` committed here, the same as the Azure workflow did.
-- **Public access:** the setup script makes the service public, like the Azure Web App, by granting `roles/run.invoker` to `allUsers`. If your organization blocks that (domain-restricted sharing), the script warns and the service requires authenticated requests. To make it private later: `gcloud run services remove-iam-policy-binding catoconsting --region REGION --member=allUsers --role=roles/run.invoker`.
-- **App config:** add environment variables or secrets with the `env_vars` / `secrets` inputs of the `deploy-cloudrun` step. Grant any GCP roles the app needs (Cloud SQL, Storage, ...) to the runtime service account, not the deployer.
+- **The repo must contain the app source.** The workflow runs `mvn package` at the repo root, so it needs `pom.xml` and `src/` committed here, the same as the Azure workflow did. Until then, pull request builds are skipped with a notice and pushes to `main` fail at "Check for application source".
+- **Public access:** setup makes the production service public, like the Azure Web App, by granting `roles/run.invoker` to `allUsers`. If your organization blocks that (domain-restricted sharing), setup warns and the service requires authenticated requests. To make it private later: `gcloud run services remove-iam-policy-binding catoconsting --region REGION --member=allUsers --role=roles/run.invoker`.
+- **Other GCP access:** grant roles the app needs (Cloud SQL, Storage, ...) to the runtime service account, not the deployer.
 - **Port:** the container passes `-Dserver.port=$PORT`, which Spring Boot honors. A non-Spring app should read the `PORT` environment variable.
 - **Retiring Azure:** once Cloud Run is serving, delete the `AZUREAPPSERVICE_PUBLISHPROFILE_...` repository secret and the Azure Web App so you stop paying for it.
 

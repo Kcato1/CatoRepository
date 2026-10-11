@@ -1,4 +1,7 @@
-# Builds the Maven JAR, packages it in a container, and deploys it to Cloud Run.
+# Builds the Maven JAR on pushes to main and on pull requests.
+# - main: deploys to the production Cloud Run service once approved in the "production" environment.
+# - Pull requests from this repo: deploy a no-traffic revision tagged pr-<number> to the separate,
+#   private catoconsting-preview service. The tag is removed when the PR closes.
 # One-time GCP setup (service accounts, Workload Identity Federation, repo variables):
 #   bash gcp/setup-cloud-run-cicd.sh PROJECT_ID [REGION]
 
@@ -8,25 +11,45 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
 
+# One run per PR (newer pushes cancel older ones); main runs queue in order.
 concurrency:
-  group: deploy-cloud-run
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  SERVICE: catoconsting
+permissions: {}
 
 jobs:
   build:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      built: ${{ steps.source.outputs.has_pom }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Until the app source is committed, PRs (e.g. to the setup scripts) shouldn't go red.
+      - name: Check for application source
+        id: source
+        run: |
+          if [[ -f pom.xml ]]; then
+            echo "has_pom=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            echo "::notice::No pom.xml at the repository root yet, so there is no app to build. Skipping."
+            echo "has_pom=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No pom.xml at the repository root. Commit the app source (pom.xml, src/) before deploying."
+            exit 1
+          fi
+
       - name: Set up Java
+        if: steps.source.outputs.has_pom == 'true'
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           java-version: '17'
@@ -34,9 +57,11 @@ jobs:
           cache: maven
 
       - name: Build with Maven
+        if: steps.source.outputs.has_pom == 'true'
         run: mvn -B clean package
 
       - name: Select application JAR
+        if: steps.source.outputs.has_pom == 'true'
         run: |
           shopt -s nullglob
           jars=()
@@ -54,6 +79,7 @@ jobs:
           cp "${jars[0]}" dist/app.jar
 
       - name: Upload JAR for deploy job
+        if: steps.source.outputs.has_pom == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: app-jar
@@ -61,8 +87,13 @@ jobs:
           if-no-files-found: error
 
   deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: build
+    # Required reviewers on this environment gate the deploy; GCP only trusts jobs in it.
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
     permissions:
       contents: read
       id-token: write  # required for Workload Identity Federation
@@ -115,10 +146,113 @@ jobs:
         id: deploy
         uses: google-github-actions/deploy-cloudrun@2028e2d7d30a78c6910e0632e48dd561b064884d # v3.0.1
         with:
-          service: ${{ env.SERVICE }}
+          service: catoconsting
           region: ${{ vars.GCP_REGION }}
           image: ${{ env.IMAGE }}
           flags: --service-account=${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+          env_vars: ${{ vars.CLOUD_RUN_ENV_VARS }}
+          env_vars_update_strategy: overwrite
+          secrets: ${{ vars.CLOUD_RUN_SECRETS }}
+          secrets_update_strategy: overwrite
 
       - name: Show service URL
         run: echo "Deployed to ${{ steps.deploy.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+
+  preview:
+    # Fork PRs get no OIDC token, so they only build. Skipped until previews are set up.
+    if: >-
+      github.event_name == 'pull_request' && github.event.action != 'closed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT != ''
+      && needs.build.outputs.built == 'true'
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: preview
+      url: ${{ steps.deploy.outputs.url }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REGION: ${{ vars.GCP_REGION }}
+      TAG: pr-${{ github.event.pull_request.number }}
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/catoconsting-preview/catoconsting:${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download JAR
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: app-jar
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_PREVIEW_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Build and push container image
+        run: |
+          gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy preview revision
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@2028e2d7d30a78c6910e0632e48dd561b064884d # v3.0.1
+        with:
+          service: catoconsting-preview
+          region: ${{ vars.GCP_REGION }}
+          image: ${{ env.IMAGE }}
+          tag: ${{ env.TAG }}
+          no_traffic: true
+          flags: --service-account=${{ vars.GCP_PREVIEW_RUNTIME_SERVICE_ACCOUNT }}
+          env_vars: ${{ vars.PREVIEW_ENV_VARS }}
+          env_vars_update_strategy: overwrite
+          secrets: ${{ vars.PREVIEW_SECRETS }}
+          secrets_update_strategy: overwrite
+
+      - name: Show preview URL
+        run: |
+          {
+            echo "Preview revision: ${{ steps.deploy.outputs.url }}"
+            echo
+            echo "The preview service is private. Open it through a local proxy:"
+            echo
+            echo "    gcloud run services proxy catoconsting-preview --tag $TAG --region $REGION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  preview-cleanup:
+    if: >-
+      github.event_name == 'pull_request' && github.event.action == 'closed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    env:
+      REGION: ${{ vars.GCP_REGION }}
+      TAG: pr-${{ github.event.pull_request.number }}
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_PREVIEW_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Remove preview tag
+        run: |
+          if gcloud run services describe catoconsting-preview --region "$REGION" --format=json \
+              | jq -e --arg tag "$TAG" '.status.traffic[]? | select(.tag == $tag)' >/dev/null; then
+            gcloud run services update-traffic catoconsting-preview --region "$REGION" --remove-tags "$TAG"
+          else
+            echo "No $TAG preview to remove."
+          fi

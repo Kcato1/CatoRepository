@@ -1,9 +1,12 @@
 #!/bin/bash
 #
-# One-time GCP setup for .github/workflows/deploy-cloud-run.yml.
-# Creates the Artifact Registry repo, deploy/runtime service accounts, and a
-# Workload Identity Federation provider so GitHub Actions can deploy without
-# a stored key. Safe to re-run.
+# One-time GCP setup for .github/workflows/deploy-cloud-run.yml. Safe to re-run.
+#
+# Production: Artifact Registry repo, deployer + runtime service accounts, a public
+#   catoconsting service, and a Workload Identity Federation provider that only trusts
+#   jobs on main running in the "production" GitHub environment.
+# Previews: the same set again, fully separate (catoconsting-preview service, private),
+#   trusting pull_request runs. Nothing preview-side can touch production.
 #
 # Usage: bash setup-cloud-run-cicd.sh PROJECT_ID [REGION]
 #
@@ -17,18 +20,76 @@ GITHUB_REPO="Kcato1/CatoRepository"
 # Numeric IDs are immutable, unlike names, so a renamed or re-created repo can't inherit access.
 GITHUB_REPO_ID="920805771"
 
-SERVICE="catoconsting"
-AR_REPO="catoconsting"
-# A pool dedicated to this repo, so no other provider in it can widen who may impersonate the deployer.
-POOL="catoconsting-github"
-PROVIDER="github-actions"
-DEPLOY_SA_NAME="catoconsting-deployer"
-RUNTIME_SA_NAME="catoconsting-runtime"
-DEPLOY_SA="$DEPLOY_SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
-RUNTIME_SA="$RUNTIME_SA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
-
 gcloud config set project "$PROJECT_ID" >/dev/null
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+
+sa_email() { echo "$1@$PROJECT_ID.iam.gserviceaccount.com"; }
+
+ensure_ar_repo() {
+    local repo=$1
+    if ! gcloud artifacts repositories describe "$repo" --location="$REGION" >/dev/null 2>&1; then
+        gcloud artifacts repositories create "$repo" \
+            --repository-format=docker --location="$REGION" --description="$repo container images"
+    fi
+}
+
+ensure_sa() {
+    if ! gcloud iam service-accounts describe "$(sa_email "$1")" >/dev/null 2>&1; then
+        gcloud iam service-accounts create "$1" --display-name="$1"
+    fi
+}
+
+# Created from Google's placeholder image so deploy roles can be scoped to the service itself.
+ensure_service() {
+    local service=$1 runtime_sa=$2
+    if ! gcloud run services describe "$service" --region="$REGION" >/dev/null 2>&1; then
+        gcloud run deploy "$service" \
+            --region="$REGION" \
+            --image=us-docker.pkg.dev/cloudrun/container/hello \
+            --service-account="$runtime_sa" \
+            --no-allow-unauthenticated \
+            --quiet
+    fi
+}
+
+# run.developer on one service: deploy revisions and move tags/traffic, but no IAM changes
+# and no access to other services.
+grant_deployer() {
+    local service=$1 repo=$2 deploy_sa=$3 runtime_sa=$4
+    gcloud run services add-iam-policy-binding "$service" --region="$REGION" \
+        --member="serviceAccount:$deploy_sa" --role="roles/run.developer" >/dev/null
+    gcloud artifacts repositories add-iam-policy-binding "$repo" --location="$REGION" \
+        --member="serviceAccount:$deploy_sa" --role="roles/artifactregistry.writer" >/dev/null
+    gcloud iam service-accounts add-iam-policy-binding "$runtime_sa" \
+        --member="serviceAccount:$deploy_sa" --role="roles/iam.serviceAccountUser" >/dev/null
+}
+
+# One pool per trust level: a principalSet binding matches identities from every provider
+# in its pool, so production and preview must not share one.
+ensure_wif() {
+    local pool=$1 provider=$2 condition=$3 deploy_sa=$4
+    local mapping="google.subject=assertion.sub,attribute.repository_id=assertion.repository_id"
+    if ! gcloud iam workload-identity-pools describe "$pool" --location=global >/dev/null 2>&1; then
+        gcloud iam workload-identity-pools create "$pool" --location=global --display-name="$pool"
+    fi
+    # Always (re)apply the mapping and condition, so an existing provider can't keep a looser one.
+    if gcloud iam workload-identity-pools providers describe "$provider" \
+            --location=global --workload-identity-pool="$pool" >/dev/null 2>&1; then
+        gcloud iam workload-identity-pools providers update-oidc "$provider" \
+            --location=global --workload-identity-pool="$pool" \
+            --attribute-mapping="$mapping" --attribute-condition="$condition"
+    else
+        gcloud iam workload-identity-pools providers create-oidc "$provider" \
+            --location=global --workload-identity-pool="$pool" \
+            --display-name="$provider" \
+            --issuer-uri="https://token.actions.githubusercontent.com" \
+            --attribute-mapping="$mapping" --attribute-condition="$condition"
+    fi
+    gcloud iam service-accounts add-iam-policy-binding "$deploy_sa" \
+        --role="roles/iam.workloadIdentityUser" \
+        --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$pool/attribute.repository_id/$GITHUB_REPO_ID" \
+        >/dev/null
+}
 
 echo "Enabling APIs..."
 gcloud services enable \
@@ -36,96 +97,75 @@ gcloud services enable \
     artifactregistry.googleapis.com \
     iam.googleapis.com \
     iamcredentials.googleapis.com \
-    sts.googleapis.com
+    sts.googleapis.com \
+    secretmanager.googleapis.com
 
-echo "Artifact Registry repository..."
-if ! gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" >/dev/null 2>&1; then
-    gcloud artifacts repositories create "$AR_REPO" \
-        --repository-format=docker \
-        --location="$REGION" \
-        --description="Catoconsting container images"
-fi
-
-echo "Service accounts..."
-for name in "$DEPLOY_SA_NAME" "$RUNTIME_SA_NAME"; do
-    if ! gcloud iam service-accounts describe "$name@$PROJECT_ID.iam.gserviceaccount.com" >/dev/null 2>&1; then
-        gcloud iam service-accounts create "$name" --display-name="$name"
-    fi
-done
-
-# Create the service from Google's placeholder image so the deployer's role can be scoped to it.
-if ! gcloud run services describe "$SERVICE" --region="$REGION" >/dev/null 2>&1; then
-    echo "Creating placeholder Cloud Run service..."
-    gcloud run deploy "$SERVICE" \
-        --region="$REGION" \
-        --image=us-docker.pkg.dev/cloudrun/container/hello \
-        --service-account="$RUNTIME_SA" \
-        --no-allow-unauthenticated \
-        --quiet
-fi
-
-echo "Granting deploy permissions..."
-# run.developer on this one service: deploy new revisions, but not touch other services or IAM.
-gcloud run services add-iam-policy-binding "$SERVICE" --region="$REGION" \
-    --member="serviceAccount:$DEPLOY_SA" --role="roles/run.developer" >/dev/null
-gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" --location="$REGION" \
-    --member="serviceAccount:$DEPLOY_SA" --role="roles/artifactregistry.writer" >/dev/null
-# Lets the deployer run the service as the runtime account (which has no roles by default).
-gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
-    --member="serviceAccount:$DEPLOY_SA" --role="roles/iam.serviceAccountUser" >/dev/null
-
-echo "Making the service public..."
-if ! gcloud run services add-iam-policy-binding "$SERVICE" --region="$REGION" \
+echo "== Production =="
+DEPLOY_SA=$(sa_email catoconsting-deployer)
+RUNTIME_SA=$(sa_email catoconsting-runtime)
+ensure_ar_repo catoconsting
+ensure_sa catoconsting-deployer
+ensure_sa catoconsting-runtime
+ensure_service catoconsting "$RUNTIME_SA"
+grant_deployer catoconsting catoconsting "$DEPLOY_SA" "$RUNTIME_SA"
+if ! gcloud run services add-iam-policy-binding catoconsting --region="$REGION" \
         --member="allUsers" --role="roles/run.invoker" >/dev/null 2>&1; then
-    echo "WARNING: could not grant public access (an org policy may restrict allUsers)."
-    echo "         The service will require authenticated requests."
+    echo "WARNING: could not make the service public (an org policy may restrict allUsers)."
+    echo "         It will require authenticated requests."
 fi
+ensure_wif catoconsting-github github-actions \
+    "assertion.repository_id=='$GITHUB_REPO_ID' && assertion.ref=='refs/heads/main' && assertion.environment=='production'" \
+    "$DEPLOY_SA"
 
-echo "Workload Identity Federation..."
-if ! gcloud iam workload-identity-pools describe "$POOL" --location=global >/dev/null 2>&1; then
-    gcloud iam workload-identity-pools create "$POOL" \
-        --location=global --display-name="GitHub Actions"
-fi
-ATTRIBUTE_MAPPING="google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.ref=assertion.ref"
-ATTRIBUTE_CONDITION="assertion.repository_id=='$GITHUB_REPO_ID' && assertion.ref=='refs/heads/main'"
-# Always (re)apply the mapping and condition, so an existing provider can't keep a looser one.
-if gcloud iam workload-identity-pools providers describe "$PROVIDER" \
-        --location=global --workload-identity-pool="$POOL" >/dev/null 2>&1; then
-    gcloud iam workload-identity-pools providers update-oidc "$PROVIDER" \
-        --location=global \
-        --workload-identity-pool="$POOL" \
-        --attribute-mapping="$ATTRIBUTE_MAPPING" \
-        --attribute-condition="$ATTRIBUTE_CONDITION"
-else
-    gcloud iam workload-identity-pools providers create-oidc "$PROVIDER" \
-        --location=global \
-        --workload-identity-pool="$POOL" \
-        --display-name="GitHub Actions" \
-        --issuer-uri="https://token.actions.githubusercontent.com" \
-        --attribute-mapping="$ATTRIBUTE_MAPPING" \
-        --attribute-condition="$ATTRIBUTE_CONDITION"
-fi
-gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA" \
-    --role="roles/iam.workloadIdentityUser" \
-    --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL/attribute.repository_id/$GITHUB_REPO_ID" \
-    >/dev/null
+echo "== Previews =="
+PREVIEW_DEPLOY_SA=$(sa_email catoconsting-preview-deployer)
+PREVIEW_RUNTIME_SA=$(sa_email catoconsting-preview-runtime)
+ensure_ar_repo catoconsting-preview
+POLICY_FILE=$(mktemp)
+trap 'rm -f "$POLICY_FILE"' EXIT
+cat > "$POLICY_FILE" <<'EOF'
+[{"name": "delete-old-previews", "action": {"type": "Delete"}, "condition": {"tagState": "any", "olderThan": "30d"}}]
+EOF
+gcloud artifacts repositories set-cleanup-policies catoconsting-preview \
+    --location="$REGION" --policy="$POLICY_FILE" --no-dry-run >/dev/null
+ensure_sa catoconsting-preview-deployer
+ensure_sa catoconsting-preview-runtime
+ensure_service catoconsting-preview "$PREVIEW_RUNTIME_SA"
+grant_deployer catoconsting-preview catoconsting-preview "$PREVIEW_DEPLOY_SA" "$PREVIEW_RUNTIME_SA"
+ensure_wif catoconsting-github-preview github-pull-requests \
+    "assertion.repository_id=='$GITHUB_REPO_ID' && assertion.event_name=='pull_request'" \
+    "$PREVIEW_DEPLOY_SA"
 
-WIF_PROVIDER="projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL/providers/$PROVIDER"
+WIF_PROVIDER="projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/catoconsting-github/providers/github-actions"
+PREVIEW_WIF_PROVIDER="projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/catoconsting-github-preview/providers/github-pull-requests"
 
 cat <<EOF
 
-GCP side is ready. Set these GitHub repository variables (Settings -> Secrets and
-variables -> Actions -> Variables), or run:
+GCP side is ready. Next:
 
-  gh variable set GCP_PROJECT_ID                 --repo $GITHUB_REPO --body "$PROJECT_ID"
-  gh variable set GCP_REGION                     --repo $GITHUB_REPO --body "$REGION"
-  gh variable set GCP_WORKLOAD_IDENTITY_PROVIDER --repo $GITHUB_REPO --body "$WIF_PROVIDER"
-  gh variable set GCP_DEPLOY_SERVICE_ACCOUNT     --repo $GITHUB_REPO --body "$DEPLOY_SA"
-  gh variable set GCP_RUNTIME_SERVICE_ACCOUNT    --repo $GITHUB_REPO --body "$RUNTIME_SA"
+1. Set the GitHub repository variables:
 
-Only workflow runs on the main branch of $GITHUB_REPO can authenticate.
+  gh variable set GCP_PROJECT_ID                         --repo $GITHUB_REPO --body "$PROJECT_ID"
+  gh variable set GCP_REGION                             --repo $GITHUB_REPO --body "$REGION"
+  gh variable set GCP_WORKLOAD_IDENTITY_PROVIDER         --repo $GITHUB_REPO --body "$WIF_PROVIDER"
+  gh variable set GCP_DEPLOY_SERVICE_ACCOUNT             --repo $GITHUB_REPO --body "$DEPLOY_SA"
+  gh variable set GCP_RUNTIME_SERVICE_ACCOUNT            --repo $GITHUB_REPO --body "$RUNTIME_SA"
+  gh variable set GCP_PREVIEW_WORKLOAD_IDENTITY_PROVIDER --repo $GITHUB_REPO --body "$PREVIEW_WIF_PROVIDER"
+  gh variable set GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT     --repo $GITHUB_REPO --body "$PREVIEW_DEPLOY_SA"
+  gh variable set GCP_PREVIEW_RUNTIME_SERVICE_ACCOUNT    --repo $GITHUB_REPO --body "$PREVIEW_RUNTIME_SA"
 
-If the app needs other GCP services at runtime, grant roles to $RUNTIME_SA, e.g.:
-  gcloud projects add-iam-policy-binding $PROJECT_ID \\
-      --member=serviceAccount:$RUNTIME_SA --role=roles/cloudsql.client
+2. Require your approval for production deploys:
+
+  bash gcp/setup-github-environments.sh
+
+3. Give the app secrets (optional). Store each value in Secret Manager, let the right
+   runtime account read it, then reference it from CLOUD_RUN_SECRETS / PREVIEW_SECRETS:
+
+  printf '%s' "\$VALUE" | gcloud secrets create db-password --data-file=-
+  gcloud secrets add-iam-policy-binding db-password \\
+      --member=serviceAccount:$RUNTIME_SA --role=roles/secretmanager.secretAccessor
+  gh variable set CLOUD_RUN_SECRETS --repo $GITHUB_REPO --body "DB_PASSWORD=db-password:latest"
+
+Production deploys only authenticate from main inside the "production" environment.
+Previews authenticate from pull_request runs and can only reach catoconsting-preview.
 EOF
