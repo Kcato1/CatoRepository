@@ -21,7 +21,7 @@ These scripts install Node.js and the `http-server` package, which provides a si
 .\setup-webserver.ps1
 
 # Or install and start immediately
-.\setup-webserver.ps1 -Port 8080 -Start
+.\setup-webserver.ps1 -Port 8081 -Start
 
 # Specify a directory to serve
 .\setup-webserver.ps1 -Directory "C:\Projects\MyApp" -Port 3000 -Start
@@ -92,17 +92,17 @@ After installation, you can use the convenient wrapper script:
 
 #### Windows
 ```powershell
-# Start with default settings (port 8080, current directory)
+# Start with default settings (port 8081, current directory)
 .\start-webserver.ps1
 
 # Specify port
 .\start-webserver.ps1 -Port 3000
 
 # Open browser automatically
-.\start-webserver.ps1 -Port 8080 -Open
+.\start-webserver.ps1 -Port 8081 -Open
 
 # Specify directory
-.\start-webserver.ps1 -Directory "C:\path\to\files" -Port 8080
+.\start-webserver.ps1 -Directory "C:\path\to\files" -Port 8081
 
 # Share on the local network (listens on every network, not just this computer)
 .\start-webserver.ps1 -Address 0.0.0.0
@@ -237,6 +237,8 @@ http-server -S -C cert.pem -K key.pem
 **Error:** `Address already in use`
 
 **Solution:** Use a different port or kill the process using that port
+
+The Windows scripts default to port 8081, because 8080 is often already taken on Windows, for example by the Apache service that EnterpriseDB's Postgres tools install (`PEMHTTPD-x64`).
 
 ```bash
 # Windows

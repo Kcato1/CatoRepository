@@ -5,7 +5,7 @@
     Convenience script to start http-server with common options.
     Install http-server first with setup-webserver.ps1.
 .PARAMETER Port
-    Port number (default: 8080)
+    Port number (default: 8081)
 .PARAMETER Directory
     Directory to serve (default: current directory)
 .PARAMETER Address
@@ -25,7 +25,7 @@
 param(
     [Parameter(Mandatory=$false)]
     [ValidateRange(1, 65535)]
-    [int]$Port = 8080,
+    [int]$Port = 8081,
 
     [Parameter(Mandatory=$false)]
     [string]$Directory = (Get-Location).Path,

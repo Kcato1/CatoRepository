@@ -12,7 +12,7 @@
     Safe to run again: installed tools are skipped, and the script exits with
     code 1 if a step failed.
 .PARAMETER Port
-    Port number for the web server (default: 8080)
+    Port number for the web server (default: 8081)
 .PARAMETER Directory
     Directory to serve (default: current directory)
 .PARAMETER Address
@@ -25,14 +25,14 @@
 .EXAMPLE
     .\setup-webserver.ps1 -Port 3000 -Start
 .EXAMPLE
-    .\setup-webserver.ps1 -Directory "C:\Projects\MyApp" -Port 8080 -Start
+    .\setup-webserver.ps1 -Directory "C:\Projects\MyApp" -Port 8081 -Start
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive setup script')]
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
     [ValidateRange(1, 65535)]
-    [int]$Port = 8080,
+    [int]$Port = 8081,
 
     [Parameter(Mandatory=$false)]
     [string]$Directory = (Get-Location).Path,
@@ -135,14 +135,14 @@ Write-Host "`nUsage Options:" -ForegroundColor Cyan
 Write-Host "`n  Option 1: Use the wrapper script" -ForegroundColor Yellow
 Write-Host "    .\start-webserver.ps1" -ForegroundColor White
 Write-Host "    .\start-webserver.ps1 -Port 3000" -ForegroundColor White
-Write-Host "    .\start-webserver.ps1 -Port 8080 -Open" -ForegroundColor White
+Write-Host "    .\start-webserver.ps1 -Port 8081 -Open" -ForegroundColor White
 Write-Host "    .\start-webserver.ps1 -Address 0.0.0.0   (share on the network)" -ForegroundColor White
 Write-Host "`n  Option 2: Use http-server directly" -ForegroundColor Yellow
-Write-Host "    http-server -a 127.0.0.1 -p 8080" -ForegroundColor White
-Write-Host "    http-server -a 127.0.0.1 -p 8080 -o" -ForegroundColor White
+Write-Host "    http-server -a 127.0.0.1 -p 8081" -ForegroundColor White
+Write-Host "    http-server -a 127.0.0.1 -p 8081 -o" -ForegroundColor White
 Write-Host "    http-server ./public -a 127.0.0.1 -p 3000" -ForegroundColor White
 Write-Host "`n  Common Options:" -ForegroundColor Yellow
-Write-Host "    -p <port>    Port number (default: 8080)" -ForegroundColor White
+Write-Host "    -p <port>    Port number (default: 8081)" -ForegroundColor White
 Write-Host "    -a <address> Address to listen on (http-server's own default is 0.0.0.0, every network)" -ForegroundColor White
 Write-Host "    -o           Open browser automatically" -ForegroundColor White
 Write-Host "    -c-1         Disable caching" -ForegroundColor White
