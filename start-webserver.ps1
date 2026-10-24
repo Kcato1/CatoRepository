@@ -37,6 +37,10 @@ param(
     [switch]$Open
 )
 
+if (-not (Get-Command http-server -ErrorAction SilentlyContinue) -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+    # npm's global folder may be missing from PATH when another account installed Node.js
+    $env:Path = "$($env:Path.TrimEnd(';'));$("$(& npm prefix -g)".Trim())"
+}
 if (-not (Get-Command http-server -ErrorAction SilentlyContinue)) {
     Write-Error "http-server is not installed. Run .\setup-webserver.ps1 first."
     exit 1

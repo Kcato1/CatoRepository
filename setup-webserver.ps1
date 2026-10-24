@@ -93,6 +93,11 @@ try {
     Write-Log "npm version: $(& npm --version)" "SUCCESS"
 
     # Step 4: Install http-server for this user (npm -g installs into the user's profile)
+    # Node's installer only puts npm's global folder on the PATH of the account that ran it
+    $npmPrefix = "$(& npm prefix -g)".Trim()
+    if ($npmPrefix -and ($env:Path -split ';') -notcontains $npmPrefix) {
+        $env:Path = "$($env:Path.TrimEnd(';'));$npmPrefix"
+    }
     Write-Log "Checking for http-server..."
     if (Get-Command http-server -ErrorAction SilentlyContinue) {
         Write-Log "http-server is already installed" "SUCCESS"
@@ -106,6 +111,14 @@ try {
             throw "npm install -g http-server failed with exit code $LASTEXITCODE"
         }
         Update-EnvironmentPath
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($npmPrefix -and ("$userPath" -split ';') -notcontains $npmPrefix) {
+            [Environment]::SetEnvironmentVariable('Path', "$("$userPath".TrimEnd(';'));$npmPrefix".TrimStart(';'), 'User')
+            Write-Log "Added $npmPrefix to your PATH" "SUCCESS"
+        }
+        if (($env:Path -split ';') -notcontains $npmPrefix) {
+            $env:Path = "$($env:Path.TrimEnd(';'));$npmPrefix"
+        }
         Write-Log "http-server installed successfully" "SUCCESS"
     }
 

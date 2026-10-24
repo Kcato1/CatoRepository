@@ -165,7 +165,11 @@ if (-not $SkipDatabases) {
     $postgresNote = "PostgreSQL generated a random password for the 'postgres' user; it is shown in the install output above. Rerun with -PostgresPassword to choose one on a fresh install."
     if ($PostgresPassword) {
         $plain = [System.Net.NetworkCredential]::new('', $PostgresPassword).Password
-        $postgresParams = "/Password:$plain"
+        if ($plain -match '"') {
+            throw "PostgresPassword cannot contain double quotes"
+        }
+        # Quote the value so Chocolatey keeps passwords that contain spaces
+        $postgresParams = "/Password:`"$plain`""
         $postgresNote = $null
     }
     Install-Tool -DisplayName "PostgreSQL" -Package postgresql -SensitiveParameters $postgresParams -Note $postgresNote -IsInstalled {
