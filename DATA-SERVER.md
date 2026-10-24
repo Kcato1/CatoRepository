@@ -9,6 +9,8 @@ It uses [Caddy](https://caddyserver.com) 2.11.7, installed by `setup-data-server
 On kevin-Mini, in **PowerShell as Administrator**, from this repository's folder:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process Bypass        # allow this repo's scripts in this window only
+Get-ChildItem -Recurse | Unblock-File            # only if you downloaded the repo as a ZIP
 .\setup-data-server.ps1
 ```
 
@@ -30,11 +32,11 @@ Re-running the script is safe: it updates the install in place and only restarts
 ## What the script does
 
 1. **Downloads Caddy 2.11.7** from its GitHub release and checks it against the published SHA-512. A mismatch stops the install. It picks the x64 or ARM64 build automatically.
-2. **Creates folders** under `C:\DataServer`: `caddy\` (program), `Caddyfile` (config), `logs\`, and `public\` (the website: `index.html` plus `data\`).
+2. **Creates folders** under `C:\DataServer`: `caddy\` (program), `Caddyfile` (config), `logs\` (`access.log` and Caddy's own `caddy.log`), `state\`, and `public\` (the website: `index.html` plus `data\`).
 3. **Writes the config** from `data-server/Caddyfile.template` and has Caddy validate it.
 4. **Installs the `DataServer` service**:
    - It starts automatically at boot (delayed start, so the network is up first) and restarts itself if it crashes.
-   - It runs as the low-privilege **LocalService** account. That account gets read access to the program and data, and write access only to `logs\`.
+   - It runs as the low-privilege **LocalService** account. That account gets read access to the program and data, and write access only to `logs\` and `state\`.
 5. **Adds a firewall rule** that lets other devices connect only on networks Windows classifies as **Private**, only from your **local subnet**, and only to `caddy.exe`.
 6. **Keeps the PC awake** on AC power (sleep and hibernate set to Never), since a sleeping server is unreachable. Skip this with `-AllowSleep`.
 7. **Checks the server answers**, then prints the addresses to use.
@@ -85,6 +87,8 @@ How the server is set up for data work:
 
 `-BasicAuthUser` turns on HTTP basic authentication: browsers show a login prompt, and tools pass credentials in the URL or as options. The password is stored only as a bcrypt hash.
 
+The first request after a login takes about a second while the password is checked; Caddy caches the result, so later requests (including the many small Range requests DuckDB and pyarrow make) are as fast as without a login. Browser tools can't fetch files cross-origin with a login on, because credentialed CORS requests need a specific origin rather than `*`.
+
 **Over plain HTTP, this is a deterrent, not real security.** Anyone on your network who captures the traffic can read the password. Don't reuse an important password, and keep sensitive data off the server.
 
 ## Managing it
@@ -93,6 +97,7 @@ How the server is set up for data work:
 Get-Service DataServer
 Restart-Service DataServer
 Get-Content C:\DataServer\logs\access.log -Tail 20       # who fetched what
+Get-Content C:\DataServer\logs\caddy.log -Tail 20        # why it didn't start
 notepad C:\DataServer\public\index.html                  # edit the landing page (re-runs don't overwrite it)
 .\setup-data-server.ps1 -Uninstall
 ```
