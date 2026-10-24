@@ -388,7 +388,8 @@ def test_validate_limits(tmp_path, capsys, monkeypatch):
     assert run("validate", "--data-dir", str(data)) == 0  # warnings only
     out = capsys.readouterr().out
     assert "WARN  my folder/ok.csv: name has spaces" in out
-    assert "WARN  big.json: over" in out and "not checked" in out
+    assert "WARN  big.json: over" in out
+    assert "not checked" in out
     assert "WARN  long.ndjson: line 2 is over" in out
 
 
