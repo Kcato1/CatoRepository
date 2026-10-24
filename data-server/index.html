@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kevin-Mini data server</title>
+<style>
+  :root { --fg: #1d2330; --muted: #5b6475; --bg: #f7f7f5; --card: #fff; --line: #e3e3de; --accent: #2457c5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6e8ee; --muted: #9aa3b5; --bg: #15171c; --card: #1d2027; --line: #2c303a; --accent: #7aa2ff; }
+  }
+  body { margin: 0; font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 20px 60px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 8px; }
+  p.lead { color: var(--muted); margin: 0 0 24px; }
+  a { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-size: 13px; }
+  code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+  .big { font-size: 17px; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>kevin-Mini data server</h1>
+  <p class="lead">Static data files for the home network. Read-only; drop files into the <code>data</code> folder on kevin-Mini to publish them.</p>
+
+  <div class="card"><a class="big" href="/data/">Browse datasets &rarr;</a></div>
+
+  <h2>DuckDB</h2>
+  <pre><code>INSTALL httpfs; LOAD httpfs;
+SELECT * FROM read_parquet('<span class="base"></span>/data/your-file.parquet') LIMIT 10;
+SELECT * FROM read_csv_auto('<span class="base"></span>/data/your-file.csv');</code></pre>
+
+  <h2>pandas</h2>
+  <pre><code>import pandas as pd
+df = pd.read_csv("<span class="base"></span>/data/your-file.csv")
+df = pd.read_parquet("<span class="base"></span>/data/your-file.parquet")  # needs pyarrow + fsspec + aiohttp</code></pre>
+
+  <h2>Polars</h2>
+  <pre><code>import polars as pl
+df = pl.read_parquet("<span class="base"></span>/data/your-file.parquet")</code></pre>
+
+  <h2>Command line</h2>
+  <pre><code>curl -O <span class="base"></span>/data/your-file.csv</code></pre>
+</main>
+<script>
+  for (const el of document.querySelectorAll(".base")) el.textContent = location.origin;
+</script>
+</body>
+</html>
