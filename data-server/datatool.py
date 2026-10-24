@@ -187,7 +187,7 @@ def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None
     convert = pacsv.ConvertOptions(column_types={n: pa.string() for n in as_text}, check_utf8=True)
     writer = None
     pending: list[pa.RecordBatch] = []
-    group_rows = 0
+    group_rows = ROW_GROUP_ROWS
     try:
         reader = pacsv.open_csv(src, read_options=read_options(opts), parse_options=parse_options(opts),
                                 convert_options=convert)
@@ -197,14 +197,14 @@ def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None
             if batch.num_rows == 0:  # nothing to write, and group_rows must never be sized from it
                 continue
             batch = blanks_to_null(batch)
-            group_rows = group_rows or rows_per_group(batch)
+            group_rows = min(group_rows, rows_per_group(batch))  # shrinks if later rows are wider
             pending.append(batch)
             if sum(b.num_rows for b in pending) >= group_rows:
                 pending = write_full_groups(writer, pa.Table.from_batches(pending), group_rows)
                 wrote_any = True
         rest = pa.Table.from_batches(pending, schema=reader.schema)
         if rest.num_rows or not wrote_any:  # an empty write still records the schema (header-only CSV)
-            writer.write_table(rest, row_group_size=max(group_rows, 1))
+            writer.write_table(rest, row_group_size=group_rows)
     except pa.ArrowInvalid as exc:
         column = column_name_from_error(str(exc), scan.names)
         if column:
@@ -285,7 +285,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
     for src in args.files:
         try:
             convert_one(src, args.out_dir, opts, args.force)
-        except ToolError as exc:
+        except (ToolError, OSError) as exc:  # one locked or unreadable file shouldn't stop the rest
             failures += 1
             print(f"ERROR {exc}", file=sys.stderr)
     return 1 if failures else 0
@@ -377,7 +377,10 @@ def validate_file(data_dir: Path, path: Path) -> list[Finding]:
     if ext in SPREADSHEETS:
         found.append(Finding("WARN", rel, "spreadsheet files can't be queried over HTTP; export to CSV or Parquet"))
     elif ext in CHECKS:
-        found.extend(CHECKS[ext](rel, path))
+        try:
+            found.extend(CHECKS[ext](rel, path))
+        except OSError as exc:  # locked by another program, or no permission
+            found.append(Finding("ERROR", rel, f"can't read the file ({exc.strerror or exc})"))
     elif ext not in OTHER_TEXT:
         found.append(Finding("NOTE", rel, "served as a plain download"))
     return found

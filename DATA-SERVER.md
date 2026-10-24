@@ -155,12 +155,13 @@ To change the Caddy config, edit `data-server/Caddyfile.template` in this repo a
 ## What was tested, and what wasn't
 
 Data tools (`datatool.py`), tested on Linux with pyarrow 26:
-- **Test suite:** 31 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
+- **Test suite:** 34 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
   - code-like values (leading zeros, hex, `+`, long numbers)
   - cp1252, byte-order marks, semicolon and tab files
   - blank first lines, multi-line cells, and text appearing late in a numeric column
   - bad headers, empty and header-only files, and blank cells
-  - row groups sized by rows and by memory, and refusing to overwrite
+  - row groups sized by rows and by memory (including rows that get wider later in the file), and refusing to overwrite
+  - files that are locked or unreadable: `convert` and `validate` report them and carry on with the rest
   - every `validate` finding, including `NaN` in JSON
   - the catalog's escaping, URLs, stability and listing of unreadable files
 

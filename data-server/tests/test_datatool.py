@@ -181,6 +181,19 @@ def test_row_groups_sized_by_bytes(tmp_path, monkeypatch):
     assert meta.num_row_groups > 1, "a wide file must be split by size, not one huge row group"
 
 
+def test_row_groups_shrink_when_later_rows_are_wider(tmp_path, monkeypatch):
+    monkeypatch.setattr(datatool, "ROW_GROUP_BYTES", 200_000)
+    monkeypatch.setattr(datatool, "BLOCK_SIZE", 1 << 16)  # the first batches hold only the short rows
+    short = "".join(f"{i},x\n" for i in range(20_000))
+    long = "".join(f"{i},{'y' * 500}\n" for i in range(3_000))
+    src = write(tmp_path / "mixed.csv", "a,b\n" + short + long)
+    assert run("convert", str(src)) == 0
+    pf = pq.ParquetFile(tmp_path / "mixed.parquet")
+    assert pf.metadata.num_rows == 23_000
+    biggest = max(pf.read_row_group(i).nbytes for i in range(pf.num_row_groups))
+    assert biggest <= 1.2 * 200_000, f"a row group held {biggest:,} bytes; the cap is 200,000"
+
+
 def test_empty_batch_from_reader_does_not_hang(tmp_path, monkeypatch):
     real_open = datatool.pacsv.open_csv
 
@@ -218,6 +231,22 @@ def test_tab_delimiter_by_name(tmp_path):
     src = write(tmp_path / "t.csv", "a\tb\n1\t2\n")
     assert run("convert", str(src), "--delimiter", "tab") == 0
     assert pq.read_table(tmp_path / "t.parquet").column_names == ["a", "b"]
+
+
+def test_convert_continues_after_unreadable_file(tmp_path, capsys, monkeypatch):
+    locked = write(tmp_path / "locked.csv", "a\n1\n")
+    ok = write(tmp_path / "ok.csv", "a\n1\n")
+    real_scan = datatool.scan_csv
+
+    def scan(path, opts):
+        if path.name == "locked.csv":
+            raise PermissionError(13, "being used by another process", str(path))
+        return real_scan(path, opts)
+
+    monkeypatch.setattr(datatool, "scan_csv", scan)
+    assert run("convert", str(locked), str(ok)) == 1
+    assert "locked.csv" in capsys.readouterr().err
+    assert (tmp_path / "ok.parquet").exists()
 
 
 def test_unknown_string_column_rejected(tmp_path, capsys):
@@ -274,6 +303,22 @@ def test_validate_clean_folder_passes(tmp_path):
     write(data / "bom.json", '\ufeff{"a": 1}')
     write(data / "bom.ndjson", '\ufeff{"a": 1}\n{"a": 2}\n')
     assert run("validate", "--data-dir", str(data)) == 0
+
+
+def test_validate_reports_unreadable_file_and_keeps_going(tmp_path, capsys, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    write(data / "a_locked.json", "{}")
+    write(data / "b_ok.csv", "a,b\n1,2\n")
+
+    def locked(rel, path):
+        raise PermissionError(13, "being used by another process", str(path))
+
+    monkeypatch.setitem(datatool.CHECKS, ".json", locked)
+    assert run("validate", "--data-dir", str(data)) == 1
+    out = capsys.readouterr().out
+    assert "ERROR a_locked.json: can't read the file" in out
+    assert "NOTE  b_ok.csv: 1 rows, 2 columns" in out
 
 
 # ---------------------------------------------------------------- catalog
