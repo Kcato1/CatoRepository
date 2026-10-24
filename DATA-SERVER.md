@@ -155,7 +155,7 @@ To change the Caddy config, edit `data-server/Caddyfile.template` in this repo a
 ## What was tested, and what wasn't
 
 Data tools (`datatool.py`), tested on Linux with pyarrow 26:
-- **Test suite:** 30 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
+- **Test suite:** 31 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
   - code-like values (leading zeros, hex, `+`, long numbers)
   - cp1252, byte-order marks, semicolon and tab files
   - blank first lines, multi-line cells, and text appearing late in a numeric column
