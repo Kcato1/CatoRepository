@@ -3,6 +3,15 @@
 {
 	auto_https off
 	persist_config off
+	# A service runs in System32; keep Caddy's state in a folder it can write.
+	storage file_system __STATE_DIR__
+	# The service manager discards stderr, so startup errors would otherwise be lost.
+	log {
+		output file __CADDY_LOG__ {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
 }
 
 http://:__PORT__ {

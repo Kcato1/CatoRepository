@@ -85,6 +85,7 @@ $BinDir = Join-Path $InstallDir 'caddy'
 $CaddyExe = Join-Path $BinDir 'caddy.exe'
 $ConfigPath = Join-Path $InstallDir 'Caddyfile'
 $LogDir = Join-Path $InstallDir 'logs'
+$StateDir = Join-Path $InstallDir 'state'
 $DataDir = Join-Path $DataRoot 'data'
 $TemplateDir = Join-Path $PSScriptRoot 'data-server'
 $BinaryPath = "`"$CaddyExe`" run --config `"$ConfigPath`" --adapter caddyfile"
@@ -206,7 +207,7 @@ function Get-AuthBlock {
     if ($RemoveBasicAuth -or -not (Test-Path $ConfigPath)) { return '' }
 
     # Keep the login from the previous run, so a plain re-run doesn't silently open the server up.
-    $existing = Get-Content -Path $ConfigPath -Raw
+    $existing = Get-Content -Path $ConfigPath -Raw -Encoding UTF8
     $m = [regex]::Match($existing, '(?m)^\s*basic_auth @authed \{\r?\n\s*(\S+ \S+)\r?\n\s*\}')
     if ($m.Success) {
         Write-Log "Keeping the existing login (use -RemoveBasicAuth to remove it)"
@@ -217,19 +218,21 @@ function Get-AuthBlock {
 
 function Write-CaddyConfig {
     param([string]$AuthBlock)
-    $template = Get-Content -Path (Join-Path $TemplateDir 'Caddyfile.template') -Raw
+    $template = Get-Content -Path (Join-Path $TemplateDir 'Caddyfile.template') -Raw -Encoding UTF8
     $bind = if ($BindAddress) { "bind $BindAddress" } else { '' }
     $values = @{
         '__PORT__'      = "$Port"
         '__DATA_ROOT__' = ConvertTo-CaddyPath $DataRoot
         '__LOG_FILE__'  = ConvertTo-CaddyPath (Join-Path $LogDir 'access.log')
+        '__CADDY_LOG__' = ConvertTo-CaddyPath (Join-Path $LogDir 'caddy.log')
+        '__STATE_DIR__' = ConvertTo-CaddyPath $StateDir
         '__BIND__'      = $bind
         '__AUTH__'      = $AuthBlock
     }
     $config = $template
     foreach ($key in $values.Keys) { $config = $config.Replace($key, $values[$key]) }
 
-    $current = if (Test-Path $ConfigPath) { Get-Content -Path $ConfigPath -Raw } else { $null }
+    $current = if (Test-Path $ConfigPath) { Get-Content -Path $ConfigPath -Raw -Encoding UTF8 } else { $null }
     if ($current -eq $config) {
         Write-Log "Config unchanged: $ConfigPath" "SUCCESS"
         return $false
@@ -246,7 +249,7 @@ function Write-CaddyConfig {
 }
 
 function Initialize-Folder {
-    foreach ($dir in @($InstallDir, $BinDir, $LogDir, $DataRoot, $DataDir)) {
+    foreach ($dir in @($InstallDir, $BinDir, $LogDir, $StateDir, $DataRoot, $DataDir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     $index = Join-Path $DataRoot 'index.html'
@@ -254,12 +257,13 @@ function Initialize-Folder {
         Copy-Item -Path (Join-Path $TemplateDir 'index.html') -Destination $index
         Write-Log "Added landing page: $index" "SUCCESS"
     }
-    # LocalService reads the program, config and data, and writes only logs. Inherited
+    # LocalService reads the program, config and data, and writes only logs and state. Inherited
     # permissions are left alone so your own access is unchanged.
     foreach ($grant in @(
             @{ Path = $InstallDir; Rights = '(OI)(CI)RX' },
             @{ Path = $DataRoot; Rights = '(OI)(CI)RX' },
-            @{ Path = $LogDir; Rights = '(OI)(CI)M' })) {
+            @{ Path = $LogDir; Rights = '(OI)(CI)M' },
+            @{ Path = $StateDir; Rights = '(OI)(CI)M' })) {
         $result = Invoke-Native 'icacls.exe' @($grant.Path, '/grant', "${LocalServiceSid}:$($grant.Rights)", '/Q')
         if ($result.ExitCode -ne 0) { throw "icacls failed on $($grant.Path): $($result.Output)" }
     }
@@ -319,7 +323,7 @@ function Start-DataServerService {
         }
         Start-Sleep -Seconds 1
     }
-    throw "Service is running but $url doesn't answer. See $LogDir and the Application event log."
+    throw "Service is running but $url doesn't answer. See $(Join-Path $LogDir 'caddy.log') and the System event log."
 }
 
 function Set-FirewallRule {
