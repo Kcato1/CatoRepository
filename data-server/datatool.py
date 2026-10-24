@@ -194,6 +194,8 @@ def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None
         writer = pq.ParquetWriter(tmp, reader.schema, compression="zstd", write_statistics=True)
         wrote_any = False
         for batch in reader:
+            if batch.num_rows == 0:  # nothing to write, and group_rows must never be sized from it
+                continue
             batch = blanks_to_null(batch)
             group_rows = group_rows or rows_per_group(batch)
             pending.append(batch)
@@ -338,7 +340,7 @@ def check_json(rel: str, path: Path) -> list[Finding]:
     try:
         with path.open(encoding="utf-8-sig") as fh:  # Notepad/PowerShell 5 add a BOM
             json.load(fh, parse_constant=reject_constant)
-    except (UnicodeDecodeError, ValueError) as exc:
+    except ValueError as exc:  # also covers UnicodeDecodeError and JSONDecodeError
         return [Finding("ERROR", rel, f"not valid UTF-8 JSON ({exc})"[:200])]
     return []
 

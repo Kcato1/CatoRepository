@@ -181,6 +181,27 @@ def test_row_groups_sized_by_bytes(tmp_path, monkeypatch):
     assert meta.num_row_groups > 1, "a wide file must be split by size, not one huge row group"
 
 
+def test_empty_batch_from_reader_does_not_hang(tmp_path, monkeypatch):
+    real_open = datatool.pacsv.open_csv
+
+    class EmptyFirst:
+        def __init__(self, reader):
+            self.schema = reader.schema
+            self._reader = reader
+
+        def __iter__(self):
+            yield datatool.pa.RecordBatch.from_pylist([], schema=self.schema)
+            yield from self._reader
+
+        def close(self):
+            self._reader.close()
+
+    monkeypatch.setattr(datatool.pacsv, "open_csv", lambda *a, **k: EmptyFirst(real_open(*a, **k)))
+    src = write(tmp_path / "e.csv", "a,b\n1,2\n3,4\n")
+    assert run("convert", str(src)) == 0
+    assert pq.read_table(tmp_path / "e.parquet").num_rows == 2
+
+
 @pytest.mark.parametrize(("args", "message"), [
     (["--delimiter", ";;"], "single character"),
     (["--encoding", "latin-9x"], "unknown encoding"),
