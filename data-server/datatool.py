@@ -336,7 +336,7 @@ def check_json(rel: str, path: Path) -> list[Finding]:
     if path.stat().st_size > MAX_JSON_PARSE_BYTES:
         return [Finding("NOTE", rel, "too large to check here; consider NDJSON or Parquet")]
     try:
-        with path.open(encoding="utf-8") as fh:
+        with path.open(encoding="utf-8-sig") as fh:  # Notepad/PowerShell 5 add a BOM
             json.load(fh, parse_constant=reject_constant)
     except (UnicodeDecodeError, ValueError) as exc:
         return [Finding("ERROR", rel, f"not valid UTF-8 JSON ({exc})"[:200])]
@@ -345,7 +345,7 @@ def check_json(rel: str, path: Path) -> list[Finding]:
 
 def check_ndjson(rel: str, path: Path) -> list[Finding]:
     try:
-        with path.open(encoding="utf-8") as fh:
+        with path.open(encoding="utf-8-sig") as fh:  # Notepad/PowerShell 5 add a BOM
             for number, line in enumerate(fh, 1):
                 if not line.strip():
                     continue

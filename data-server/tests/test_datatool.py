@@ -250,6 +250,8 @@ def test_validate_clean_folder_passes(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     write(data / "ok.csv", "a,b\n1,2\n")
+    write(data / "bom.json", '\ufeff{"a": 1}')
+    write(data / "bom.ndjson", '\ufeff{"a": 1}\n{"a": 2}\n')
     assert run("validate", "--data-dir", str(data)) == 0
 
 
