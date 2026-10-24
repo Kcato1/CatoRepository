@@ -15,6 +15,7 @@ import argparse
 import codecs
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -81,11 +82,16 @@ def replace_file(tmp: Path, dest: Path) -> None:
         raise ToolError(f"{dest.name} is in use (probably being downloaded); try again in a moment") from exc
 
 
+def temp_path(dest: Path) -> Path:
+    """Hidden (so never served) and unique per process, so two runs can't clobber each other's file."""
+    return dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+
+
 def write_text_atomic(dest: Path, text: str) -> bool:
     """Write text via a hidden temp file; return False if the file already had this content."""
     if dest.exists() and dest.read_text(encoding="utf-8") == text:
         return False
-    tmp = dest.with_name(f".{dest.name}.tmp")
+    tmp = temp_path(dest)
     tmp.write_text(text, encoding="utf-8", newline="\n")
     replace_file(tmp, dest)
     return True
@@ -182,30 +188,55 @@ def column_name_from_error(text: str, names: list[str]) -> str | None:
     return None
 
 
-def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None:
+class LateFloat(Exception):  # control flow inside convert, never shown to the user
+    """A column inferred as integers turned out to have decimals further down."""
+
+    def __init__(self, column: str) -> None:
+        super().__init__(column)
+        self.column = column
+
+
+def late_float_column(text: str, names: list[str]) -> str | None:
+    """The column, if this error is an integer column meeting a finite decimal value."""
+    m = re.search(r"conversion error to int64: invalid value '([^']*)'", text)
+    if not m:
+        return None
+    try:
+        if not math.isfinite(float(m.group(1))):
+            return None
+    except ValueError:
+        return None
+    return column_name_from_error(text, names)
+
+
+def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions, float_columns: set[str]) -> None:
     as_text = set(scan.text_columns) | opts.string_columns
-    convert = pacsv.ConvertOptions(column_types={n: pa.string() for n in as_text}, check_utf8=True)
+    types = {n: pa.float64() for n in float_columns} | {n: pa.string() for n in as_text}
+    convert = pacsv.ConvertOptions(column_types=types, check_utf8=True)
     writer = None
     pending: list[pa.RecordBatch] = []
-    group_rows = ROW_GROUP_ROWS
     try:
         reader = pacsv.open_csv(src, read_options=read_options(opts), parse_options=parse_options(opts),
                                 convert_options=convert)
         writer = pq.ParquetWriter(tmp, reader.schema, compression="zstd", write_statistics=True)
         wrote_any = False
         for batch in reader:
-            if batch.num_rows == 0:  # nothing to write, and group_rows must never be sized from it
+            if batch.num_rows == 0:
                 continue
-            batch = blanks_to_null(batch)
-            group_rows = min(group_rows, rows_per_group(batch))  # shrinks if later rows are wider
-            pending.append(batch)
-            if sum(b.num_rows for b in pending) >= group_rows:
+            pending.append(blanks_to_null(batch))
+            # Sized from what's pending, so groups shrink for wide rows and grow back after them.
+            rows, nbytes = sum(b.num_rows for b in pending), sum(b.nbytes for b in pending)
+            if rows >= ROW_GROUP_ROWS or nbytes >= ROW_GROUP_BYTES:
+                group_rows = max(1, min(ROW_GROUP_ROWS, int(ROW_GROUP_BYTES * rows / max(nbytes, 1))))
                 pending = write_full_groups(writer, pa.Table.from_batches(pending), group_rows)
                 wrote_any = True
         rest = pa.Table.from_batches(pending, schema=reader.schema)
         if rest.num_rows or not wrote_any:  # an empty write still records the schema (header-only CSV)
-            writer.write_table(rest, row_group_size=group_rows)
+            writer.write_table(rest, row_group_size=ROW_GROUP_ROWS)
     except pa.ArrowInvalid as exc:
+        column = late_float_column(str(exc), scan.names)
+        if column:
+            raise LateFloat(column) from exc
         column = column_name_from_error(str(exc), scan.names)
         if column:
             raise ToolError(
@@ -215,14 +246,6 @@ def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None
     finally:
         if writer is not None:
             writer.close()
-
-
-def rows_per_group(batch: pa.RecordBatch) -> int:
-    """Rows per row group: ROW_GROUP_BYTES of data, at most ROW_GROUP_ROWS (0 until rows arrive)."""
-    if batch.num_rows == 0:
-        return 0
-    bytes_per_row = max(batch.nbytes / batch.num_rows, 1)
-    return max(1, min(ROW_GROUP_ROWS, int(ROW_GROUP_BYTES / bytes_per_row)))
 
 
 def blanks_to_null(batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -257,20 +280,36 @@ def convert_one(src: Path, out_dir: Path | None, opts: CsvOptions, force: bool) 
     if not src.is_file():
         raise ToolError(f"{src}: file not found")
     dest = output_path(src, out_dir)
+    if is_hidden(dest):
+        raise ToolError(f"{src.name}: {dest.name} would be hidden (the server doesn't serve names starting "
+                        "with '.'); rename the CSV first")
     if dest.exists() and not force:
         raise ToolError(f"{dest.name} already exists; add --force to replace it")
+    before = src.stat()
     scan = scan_csv(src, opts)
     missing = opts.string_columns - set(scan.names)
     if missing:
         raise ToolError(f"{src.name}: --string-columns names not in the file: {', '.join(sorted(missing))}")
-    tmp = dest.with_name(f".{dest.name}.tmp")
+    tmp = temp_path(dest)
+    floats: set[str] = set()
     try:
-        write_parquet(src, tmp, scan, opts)
+        while True:
+            try:
+                write_parquet(src, tmp, scan, opts, floats)
+                break
+            except LateFloat as late:  # e.g. 1, 2, 3 ... then 2.5: store the column as decimals
+                if late.column in floats:
+                    raise ToolError(f"{src.name}: column '{late.column}' couldn't be read as numbers") from late
+                floats.add(late.column)
         meta = verify_parquet(tmp, scan)
+        after = src.stat()
+        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            raise ToolError(f"{src.name} changed while it was being converted; run convert again")
         replace_file(tmp, dest)
     finally:
         tmp.unlink(missing_ok=True)
     kept = f"; kept as text: {describe_text_columns(scan.text_columns)}" if scan.text_columns else ""
+    kept += f"; decimals found further down: {', '.join(sorted(floats))}" if floats else ""
     print(f"OK    {src.name} -> {dest}  ({meta.num_rows:,} rows, {meta.num_columns} columns, "
           f"{dest.stat().st_size / src.stat().st_size:.0%} of CSV size{kept})")
     return dest
@@ -282,7 +321,15 @@ def cmd_convert(args: argparse.Namespace) -> int:
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
     failures = 0
+    claimed: dict[Path, Path] = {}  # destination -> the input that converts to it
     for src in args.files:
+        dest = output_path(src, args.out_dir).resolve()
+        if dest in claimed:
+            failures += 1
+            print(f"ERROR {src} and {claimed[dest]} would both become {dest.name}; "
+                  "convert them into different --out-dir folders", file=sys.stderr)
+            continue
+        claimed[dest] = src
         try:
             convert_one(src, args.out_dir, opts, args.force)
         except (ToolError, OSError) as exc:  # one locked or unreadable file shouldn't stop the rest
@@ -301,8 +348,8 @@ class Finding:
     message: str
 
 
-def check_name(rel: str, path: Path) -> list[Finding]:
-    if SAFE_NAME.match(path.name):
+def check_name(rel: str) -> list[Finding]:
+    if all(SAFE_NAME.match(part) for part in rel.split("/")):  # folders are part of the URL too
         return []
     return [Finding("WARN", rel, "name has spaces or special characters; rename to letters, digits, - _ . "
                                  "so URLs and code snippets work")]
@@ -336,7 +383,8 @@ def reject_constant(name: str) -> None:
 
 def check_json(rel: str, path: Path) -> list[Finding]:
     if path.stat().st_size > MAX_JSON_PARSE_BYTES:
-        return [Finding("NOTE", rel, "too large to check here; consider NDJSON or Parquet")]
+        return [Finding("WARN", rel, f"over {MAX_JSON_PARSE_BYTES >> 20} MB, so not checked; "
+                                     "consider NDJSON or Parquet")]
     try:
         with path.open(encoding="utf-8-sig") as fh:  # Notepad/PowerShell 5 add a BOM
             json.load(fh, parse_constant=reject_constant)
@@ -348,7 +396,11 @@ def check_json(rel: str, path: Path) -> list[Finding]:
 def check_ndjson(rel: str, path: Path) -> list[Finding]:
     try:
         with path.open(encoding="utf-8-sig") as fh:  # Notepad/PowerShell 5 add a BOM
-            for number, line in enumerate(fh, 1):
+            # Bounded reads, so one enormous record can't use up memory.
+            for number, line in enumerate(iter(lambda: fh.readline(MAX_JSON_PARSE_BYTES), ""), 1):
+                if len(line) == MAX_JSON_PARSE_BYTES and not line.endswith("\n"):
+                    return [Finding("WARN", rel, f"line {number} is over {MAX_JSON_PARSE_BYTES >> 20} MB, "
+                                                 "so the rest wasn't checked")]
                 if not line.strip():
                     continue
                 try:
@@ -373,7 +425,7 @@ def validate_file(data_dir: Path, path: Path) -> list[Finding]:
     if is_hidden(path):
         return [Finding("NOTE", rel, "hidden file; the server won't serve it")]
     ext = path.suffix.lower()
-    found = check_name(rel, path)
+    found = check_name(rel)
     if ext in SPREADSHEETS:
         found.append(Finding("WARN", rel, "spreadsheet files can't be queried over HTTP; export to CSV or Parquet"))
     elif ext in CHECKS:
@@ -414,7 +466,9 @@ def basic_entry(data_dir: Path, path: Path) -> dict:
 def describe(data_dir: Path, path: Path, scan_csvs: bool) -> dict:
     entry = basic_entry(data_dir, path)
     if entry["format"] == "parquet":
-        meta = pq.ParquetFile(path).metadata
+        with path.open("rb") as fh:  # size and metadata from the same version, even if it's replaced now
+            entry["bytes"] = os.fstat(fh.fileno()).st_size
+            meta = pq.ParquetFile(fh).metadata
         entry["rows"] = meta.num_rows
         entry["columns"] = [{"name": f.name, "type": str(f.type)} for f in meta.schema.to_arrow_schema()]
     elif entry["format"] == "csv":
@@ -495,20 +549,24 @@ def render_html(entries: list[dict]) -> str:
 
 def cmd_catalog(args: argparse.Namespace) -> int:
     out_dir = args.out_dir or args.data_dir.parent
+    outputs = {(out_dir / name).resolve() for name in CATALOG_FILES}
     entries, failures = [], 0
     for path in iter_files(args.data_dir):
-        if is_hidden(path) or path.suffix.lower() not in SERVED_TYPES or path.name in CATALOG_FILES:
+        if is_hidden(path) or path.suffix.lower() not in SERVED_TYPES or path.resolve() in outputs:
             continue
         try:
             entries.append(describe(args.data_dir, path, args.scan_csv))
         except (ToolError, pa.ArrowInvalid, OSError) as exc:
+            if not path.exists():  # deleted while the catalog was being built
+                continue
             failures += 1
             message = str(exc).removeprefix(f"{path.name}: ")
             print(f"ERROR {path.name}: {message}", file=sys.stderr)
             # Still listed: the server serves it either way. Run validate for details.
             entries.append(basic_entry(args.data_dir, path) | {"error": message})
     doc = json.dumps({"datasets": entries}, indent=2, ensure_ascii=False) + "\n"
-    for name, text in (("catalog.json", doc), ("catalog.html", render_html(entries))):
+    # HTML first: the landing page links to catalog.html once catalog.json exists.
+    for name, text in (("catalog.html", render_html(entries)), ("catalog.json", doc)):
         changed = write_text_atomic(out_dir / name, text)
         print(f"{'Wrote' if changed else 'Unchanged'}: {out_dir / name}")
     print(f"{len(entries)} dataset(s)")

@@ -194,6 +194,63 @@ def test_row_groups_shrink_when_later_rows_are_wider(tmp_path, monkeypatch):
     assert biggest <= 1.2 * 200_000, f"a row group held {biggest:,} bytes; the cap is 200,000"
 
 
+def test_row_groups_grow_back_after_wide_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(datatool, "ROW_GROUP_BYTES", 200_000)
+    monkeypatch.setattr(datatool, "BLOCK_SIZE", 1 << 16)
+    long = "".join(f"{i},{'y' * 500}\n" for i in range(300))
+    short = "".join(f"{i},x\n" for i in range(60_000))
+    src = write(tmp_path / "mixed.csv", "a,b\n" + long + short)
+    assert run("convert", str(src)) == 0
+    sizes = [rg.num_rows for rg in (pq.ParquetFile(tmp_path / "mixed.parquet").metadata.row_group(i)
+                                    for i in range(pq.ParquetFile(tmp_path / "mixed.parquet").num_row_groups))]
+    assert sum(sizes) == 60_300
+    assert max(sizes) > 5_000, f"narrow rows after wide ones must get big row groups again: {sizes}"
+
+
+def test_late_decimals_in_integer_column(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(datatool, "BLOCK_SIZE", 1 << 12)  # types are inferred from the first block only
+    src = write(tmp_path / "prices.csv", "price,name\n" + "".join(f"{i},x\n" for i in range(3000)) + "2.5,y\n")
+    assert run("convert", str(src)) == 0
+    assert "decimals found further down: price" in capsys.readouterr().out
+    table = pq.read_table(tmp_path / "prices.parquet")
+    assert str(table.schema.field("price").type) == "double"
+    assert table.column("price")[-1].as_py() == 2.5
+    assert table.column("price")[7].as_py() == 7
+
+
+def test_hidden_csv_rejected(tmp_path, capsys):
+    src = write(tmp_path / ".sales.csv", "a\n1\n")
+    assert run("convert", str(src)) == 1
+    assert "would be hidden" in capsys.readouterr().err
+    assert not (tmp_path / ".sales.parquet").exists()
+
+
+def test_same_output_name_twice_rejected(tmp_path, capsys):
+    (tmp_path / "jan").mkdir()
+    (tmp_path / "feb").mkdir()
+    one = write(tmp_path / "jan" / "sales.csv", "a\n1\n")
+    two = write(tmp_path / "feb" / "sales.csv", "a\n2\n")
+    out = tmp_path / "out"
+    assert run("convert", str(one), str(two), "--out-dir", str(out), "--force") == 1
+    assert "would both become sales.parquet" in capsys.readouterr().err
+    assert pq.read_table(out / "sales.parquet").column("a")[0].as_py() == 1
+
+
+def test_source_changed_during_convert_is_not_published(tmp_path, capsys, monkeypatch):
+    src = write(tmp_path / "live.csv", "a\n1\n")
+    real_write = datatool.write_parquet
+
+    def write_then_append(*args):
+        real_write(*args)
+        with src.open("a") as fh:
+            fh.write("2\n")
+
+    monkeypatch.setattr(datatool, "write_parquet", write_then_append)
+    assert run("convert", str(src)) == 1
+    assert "changed while it was being converted" in capsys.readouterr().err
+    assert not (tmp_path / "live.parquet").exists()
+
+
 def test_empty_batch_from_reader_does_not_hang(tmp_path, monkeypatch):
     real_open = datatool.pacsv.open_csv
 
@@ -321,6 +378,20 @@ def test_validate_reports_unreadable_file_and_keeps_going(tmp_path, capsys, monk
     assert "NOTE  b_ok.csv: 1 rows, 2 columns" in out
 
 
+def test_validate_limits(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(datatool, "MAX_JSON_PARSE_BYTES", 64)
+    data = tmp_path / "data"
+    (data / "my folder").mkdir(parents=True)
+    write(data / "my folder" / "ok.csv", "a\n1\n")
+    write(data / "big.json", "[" + "1," * 100 + "1]")
+    write(data / "long.ndjson", '{"a": 1}\n{"b": "' + "x" * 100 + '"}\n')
+    assert run("validate", "--data-dir", str(data)) == 0  # warnings only
+    out = capsys.readouterr().out
+    assert "WARN  my folder/ok.csv: name has spaces" in out
+    assert "WARN  big.json: over" in out and "not checked" in out
+    assert "WARN  long.ndjson: line 2 is over" in out
+
+
 # ---------------------------------------------------------------- catalog
 
 
@@ -363,6 +434,15 @@ def test_catalog_lists_unreadable_files_with_error(tmp_path):
     assert entry["path"] == "semi.csv"
     assert "--delimiter" in entry["error"]
     assert "Can't read" in (tmp_path / "public" / "catalog.html").read_text(encoding="utf-8")
+
+
+def test_catalog_lists_datasets_named_like_its_own_files(tmp_path):
+    data = tmp_path / "public" / "data"
+    (data / "sub").mkdir(parents=True)
+    write(data / "sub" / "catalog.json", '{"a": 1}')
+    assert run("catalog", "--data-dir", str(data)) == 0
+    doc = json.loads((tmp_path / "public" / "catalog.json").read_text(encoding="utf-8"))
+    assert [e["path"] for e in doc["datasets"]] == ["sub/catalog.json"]
 
 
 def test_catalog_scan_csv_counts_rows(tmp_path):

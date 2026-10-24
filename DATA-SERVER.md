@@ -94,7 +94,7 @@ py data-server\datatool.py validate
 py data-server\datatool.py catalog
 ```
 
-`validate` and `catalog` use `C:\DataServer\public\data` by default; pass `--data-dir` for another folder. Every command exits with 1 if something failed, so it can be used in scripts.
+`validate` and `catalog` use `C:\DataServer\public\data` by default; pass `--data-dir` for another folder. Every command exits with 1 if something failed (2 for a usage mistake, such as an unknown option), so it can be used in scripts.
 
 ### `convert`: CSV to Parquet
 
@@ -115,6 +115,10 @@ The command:
   - The file uses `;` or tabs as separators: add `--delimiter ';'` or `--delimiter tab`.
   - A column looks numeric at first but has text further down: add `--string-columns name`.
   - The header has empty or duplicate column names.
+  - The CSV's name starts with `.`, since the Parquet file would be hidden too.
+  - Two inputs in one run would get the same output name (`jan\sales.csv` and `feb\sales.csv` into one `--out-dir`).
+  - The CSV changed while it was being converted. Run it again once whatever is writing the file has finished.
+- Stores a column as decimals if it starts with whole numbers and has decimals further down (`1`, `2`, ... `2.5`).
 - Turns blank cells into missing values in every column. `NA`, `N/A`, `NULL` and `NaN` count as missing only **in numeric columns**; text columns keep them as written, so `NA` for Namibia stays `NA`.
 - Handles quoted cells that contain line breaks, and blank lines before the header.
 
@@ -122,12 +126,12 @@ The command:
 
 `validate` reads every file in the data folder (Parquet only from its footer, so it stays fast) and reports:
 - **Errors:** files that won't work, such as unreadable Parquet, CSVs with inconsistent rows or bad encoding, and invalid JSON or NDJSON (with the line number). `NaN` and `Infinity` count as invalid, since browsers can't parse them.
-- **Warnings:** names with spaces or special characters (they break URLs and code snippets), spreadsheets (`.xlsx` can't be queried over HTTP), and temp files left by an interrupted run.
+- **Warnings:** names with spaces or special characters, in the file or its folders (they break URLs and code snippets), JSON files over 200 MB and NDJSON lines over 200 MB (too big to check), spreadsheets (`.xlsx` can't be queried over HTTP), and temp files left by an interrupted run.
 - **Notes:** row and column counts, leading-zero columns, large CSVs worth converting, and hidden files the server won't serve.
 
 ### `catalog`: a page listing every dataset
 
-`catalog` writes `catalog.json` and `catalog.html` next to the `data` folder, so they're served at `/catalog.json` and `/catalog.html`. Each dataset shows its size and columns; Parquet files also show column types and row counts. CSVs show row counts only with `--scan-csv`, since that reads every CSV in full. A file that can't be read is still listed, with the reason, because the server serves it anyway. Run it again after adding files; a re-run with nothing changed doesn't rewrite anything.
+`catalog` writes `catalog.json` and `catalog.html` next to the `data` folder, so they're served at `/catalog.json` and `/catalog.html`. Each dataset shows its size. CSV and Parquet files also show their columns, and Parquet files show column types and row counts. CSVs show row counts only with `--scan-csv`, since that reads every CSV in full. A file that can't be read is still listed, with the reason, because the server serves it anyway. Run it again after adding files; a re-run with nothing changed doesn't rewrite anything.
 
 The landing page links to the catalog once it exists. Installs set up before this change keep their own `index.html`; to get the link, copy `data-server\index.html` over `C:\DataServer\public\index.html`, or just open `/catalog.html`.
 
@@ -155,12 +159,13 @@ To change the Caddy config, edit `data-server/Caddyfile.template` in this repo a
 ## What was tested, and what wasn't
 
 Data tools (`datatool.py`), tested on Linux with pyarrow 26:
-- **Test suite:** 34 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
+- **Test suite:** 41 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
   - code-like values (leading zeros, hex, `+`, long numbers)
   - cp1252, byte-order marks, semicolon and tab files
-  - blank first lines, multi-line cells, and text appearing late in a numeric column
+  - blank first lines, multi-line cells, and text or decimals appearing late in a numeric column
   - bad headers, empty and header-only files, and blank cells
-  - row groups sized by rows and by memory (including rows that get wider later in the file), and refusing to overwrite
+  - row groups sized by rows and by memory, as rows get wider or narrower through the file
+  - refusing to overwrite, hidden output names, two inputs with one output name, and a CSV that changes mid-run
   - files that are locked or unreadable: `convert` and `validate` report them and carry on with the rest
   - every `validate` finding, including `NaN` in JSON
   - the catalog's escaping, URLs, stability and listing of unreadable files
