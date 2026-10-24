@@ -336,9 +336,19 @@ function Set-FirewallRule {
         -Profile Private -RemoteAddress LocalSubnet -Program $CaddyExe | Out-Null
     Write-Log "Firewall: TCP $Port allowed on Private networks from the local subnet only" "SUCCESS"
 
+    # Only the home network matters. Switching other Public networks (VPNs, virtual or
+    # second adapters) to Private would open this and other Private-profile rules on them.
+    $lanIndex = Get-LanInterfaceIndex
+    if ($SetNetworkPrivate -and -not $lanIndex) {
+        Write-Log "Couldn't tell which network is your home network (no default route), so none was switched." "WARNING"
+    }
     $public = @(Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq 'Public' })
     foreach ($net in $public) {
-        if ($SetNetworkPrivate) {
+        if (-not $lanIndex) {
+            Write-Log "Network '$($net.Name)' is classified Public, so other devices can't connect through it." "WARNING"
+        } elseif ($net.InterfaceIndex -ne $lanIndex) {
+            Write-Log "Leaving network '$($net.Name)' as Public: it isn't the one this PC uses to reach your router"
+        } elseif ($SetNetworkPrivate) {
             Set-NetConnectionProfile -InterfaceIndex $net.InterfaceIndex -NetworkCategory Private
             Write-Log "Network '$($net.Name)' switched from Public to Private" "SUCCESS"
         } else {
@@ -346,6 +356,18 @@ function Set-FirewallRule {
                 "If this is your home network, re-run with -SetNetworkPrivate.") "WARNING"
         }
     }
+}
+
+# The interface of -BindAddress, otherwise the one carrying the default route.
+function Get-LanInterfaceIndex {
+    if ($BindAddress) {
+        return (Get-NetIPAddress -IPAddress $BindAddress).InterfaceIndex
+    }
+    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Sort-Object -Property { $_.RouteMetric + $_.InterfaceMetric } |
+        Select-Object -First 1
+    if ($route) { return $route.InterfaceIndex }
+    return $null
 }
 
 function Set-SleepPolicy {
