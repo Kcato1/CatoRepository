@@ -83,6 +83,47 @@ How the server is set up for data work:
 
 **Browser tools on `https://` sites can't use this server.** Examples are shell.duckdb.org and Observable. Browsers block an `https://` page from fetching an `http://` address (mixed content), and Chrome also asks for local-network permission. Use DuckDB, pandas or Polars locally instead, or serve the tool's page from this server too.
 
+## Preparing data: `datatool.py`
+
+`data-server/datatool.py` converts, checks and catalogs your files. It needs Python 3.10+ and pyarrow, and runs from your normal account (no admin needed):
+
+```powershell
+py -m pip install pyarrow
+py data-server\datatool.py convert C:\Downloads\sales.csv --out-dir C:\DataServer\public\data
+py data-server\datatool.py validate
+py data-server\datatool.py catalog
+```
+
+`validate` and `catalog` use `C:\DataServer\public\data` by default; pass `--data-dir` for another folder. Every command exits with 1 if something failed, so it can be used in scripts.
+
+### `convert`: CSV to Parquet
+
+Parquet files are typically a quarter of the CSV's size and much faster to query over the network, because DuckDB, pyarrow and Polars fetch only the columns and row groups they need.
+
+The command:
+- Keeps the CSV. If the `.parquet` already exists, it refuses to replace it unless you add `--force`.
+- Writes to a hidden temp file first (the server never serves it). It checks that file's row count and column names, then swaps it in, so readers never see a half-written file.
+- Keeps columns with **leading zeros** (ZIP codes, IDs like `00123`) as text. Otherwise they'd be read as numbers and lose the zeros.
+- Stops with a clear message, instead of writing bad data, when:
+  - The text isn't UTF-8. Excel exports on Windows are often cp1252: add `--encoding cp1252`.
+  - The file uses `;` or tabs as separators: add `--delimiter ';'`.
+  - A column looks numeric at first but has text further down: add `--string-columns name`.
+  - The header has empty or duplicate column names.
+- Treats `NA`, `N/A`, `NULL`, `NaN` and blanks as missing values **in numeric columns only**. Text columns keep them as written, so `NA` for Namibia stays `NA`.
+
+### `validate`: check before you publish
+
+`validate` reads every file in the data folder (Parquet only from its footer, so it stays fast) and reports:
+- **Errors:** files that won't work, such as unreadable Parquet, CSVs with inconsistent rows or bad encoding, and invalid JSON or NDJSON (with the line number).
+- **Warnings:** names with spaces or special characters (they break URLs and code snippets), spreadsheets (`.xlsx` can't be queried over HTTP), and temp files left by an interrupted run.
+- **Notes:** row and column counts, leading-zero columns, large CSVs worth converting, and hidden files the server won't serve.
+
+### `catalog`: a page listing every dataset
+
+`catalog` writes `catalog.json` and `catalog.html` next to the `data` folder, so they're served at `/catalog.json` and `/catalog.html`. Each dataset shows its size and columns; Parquet files also show column types and row counts. CSVs show row counts only with `--scan-csv`, since that reads every CSV in full. Run it again after adding files; a re-run with nothing changed doesn't rewrite anything.
+
+The landing page links to the catalog once it exists. Installs set up before this change keep their own `index.html`; to get the link, copy `data-server\index.html` over `C:\DataServer\public\index.html`, or just open `/catalog.html`.
+
 ## The optional login
 
 `-BasicAuthUser` turns on HTTP basic authentication: browsers show a login prompt, and tools pass credentials in the URL or as options. The password is stored only as a bcrypt hash.
@@ -105,6 +146,15 @@ notepad C:\DataServer\public\index.html                  # edit the landing page
 To change the Caddy config, edit `data-server/Caddyfile.template` in this repo and re-run the script. Edits made directly to `C:\DataServer\Caddyfile` are replaced on the next run.
 
 ## What was tested, and what wasn't
+
+Data tools (`datatool.py`), tested on Linux with pyarrow 26:
+- **Test suite:** 18 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover leading zeros, cp1252, byte-order marks, semicolon files, text appearing late in a numeric column, bad headers, empty and header-only files, row-group sizes, refusing to overwrite, every `validate` finding, and the catalog's escaping, URLs and stability.
+- **End to end:** a 200,000-row CSV was converted, validated and cataloged, then served through Caddy with this config and read over HTTP with DuckDB, pandas and Polars. ZIP codes stayed text and dates came through as dates.
+- **Not tested on Windows:**
+  - Replacing a `.parquet` while someone is downloading it. Windows may lock the file; the tool then says it's in use instead of failing silently.
+  - Real Excel exports.
+  - Windows paths and the default data folder.
+
 
 The script hasn't been run on Windows yet. What was tested, in a Linux sandbox:
 - **Caddy's behavior:** the same 2.11.7 build and the same config template. This covered content types, Range requests (206), compression on CSV only, CORS preflight, hidden files, the login, and binding to one address.
