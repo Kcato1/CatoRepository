@@ -237,14 +237,17 @@ function Write-CaddyConfig {
         Write-Log "Config unchanged: $ConfigPath" "SUCCESS"
         return $false
     }
-    [IO.File]::WriteAllText($ConfigPath, $config, (New-Object Text.UTF8Encoding $false))
-    Write-Log "Wrote $ConfigPath" "SUCCESS"
-
-    $result = Invoke-Native $CaddyExe @('validate', '--config', $ConfigPath, '--adapter', 'caddyfile')
+    # Validate a candidate first: a rejected config left in place would break the next
+    # restart or reboot, and a re-run would then see it as unchanged.
+    $candidate = "$ConfigPath.new"
+    [IO.File]::WriteAllText($candidate, $config, (New-Object Text.UTF8Encoding $false))
+    $result = Invoke-Native $CaddyExe @('validate', '--config', $candidate, '--adapter', 'caddyfile')
     if ($result.ExitCode -ne 0) {
-        throw "Caddy rejected the generated config:`n$($result.Output)"
+        Remove-Item -Path $candidate -Force -ErrorAction SilentlyContinue
+        throw "Caddy rejected the generated config (the current one is unchanged):`n$($result.Output)"
     }
-    Write-Log "Config validated" "SUCCESS"
+    Move-Item -Path $candidate -Destination $ConfigPath -Force
+    Write-Log "Wrote and validated $ConfigPath" "SUCCESS"
     return $true
 }
 
