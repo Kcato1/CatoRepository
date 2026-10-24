@@ -49,7 +49,8 @@ def test_late_text_in_numeric_column_names_column(tmp_path, capsys, monkeypatch)
     src = write(tmp_path / "late.csv", "id,val\n" + rows + "300000,abc\n")
     assert run("convert", str(src)) == 1
     err = capsys.readouterr().err
-    assert "'val'" in err and "--string-columns val" in err
+    assert "'val'" in err
+    assert "--string-columns val" in err
     assert not (tmp_path / "late.parquet").exists()
     assert not list(tmp_path.glob(".*.tmp"))
     assert run("convert", str(src), "--string-columns", "val") == 0
@@ -95,7 +96,8 @@ def test_bad_headers_rejected(tmp_path, capsys):
     empty_name = write(tmp_path / "blank.csv", "a,\n1,2\n")
     assert run("convert", str(dup), str(empty_name)) == 1
     err = capsys.readouterr().err
-    assert "duplicate column names: a" in err and "empty name" in err
+    assert "duplicate column names: a" in err
+    assert "empty name" in err
 
 
 def test_empty_and_header_only(tmp_path, capsys):
@@ -105,7 +107,8 @@ def test_empty_and_header_only(tmp_path, capsys):
     header = write(tmp_path / "header.csv", "a,b\n")
     assert run("convert", str(header)) == 0
     meta = pq.ParquetFile(tmp_path / "header.parquet").metadata
-    assert meta.num_rows == 0 and meta.num_columns == 2
+    assert meta.num_rows == 0
+    assert meta.num_columns == 2
 
 
 def test_row_groups_are_batched(tmp_path, monkeypatch):
@@ -127,6 +130,75 @@ def test_ragged_rows_rejected(tmp_path, capsys):
     assert "different numbers of fields" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("value", "other", "reason"), [
+    ("0x1F", "0XFF", "hex values"),
+    ("+15551234567", "+15550000000", "leading +"),
+    ("12345678901234567890", "1", "16+ digit numbers"),
+    ("9007199254740993", "1.5", "16+ digit numbers"),
+])
+def test_code_like_values_kept_as_text(tmp_path, capsys, value, other, reason):
+    src = write(tmp_path / "codes.csv", f"code,n\n{value},1\n{other},2\n")
+    assert run("convert", str(src)) == 0
+    table = pq.read_table(tmp_path / "codes.parquet")
+    assert table.column("code").to_pylist() == [value, other]
+    assert table.schema.field("n").type == "int64"
+    assert f"code ({reason})" in capsys.readouterr().out
+
+
+def test_blank_first_line_keeps_header(tmp_path):
+    src = write(tmp_path / "blank.csv", "\r\n\nid,v\n1,2\n")
+    assert run("convert", str(src)) == 0
+    table = pq.read_table(tmp_path / "blank.parquet")
+    assert table.to_pylist() == [{"id": 1, "v": 2}]
+
+
+def test_multiline_cells_across_blocks(tmp_path, monkeypatch):
+    monkeypatch.setattr(datatool, "BLOCK_SIZE", 4096)
+    rows = "".join(f'{i},"line one\nline two {i}"\n' for i in range(2000))
+    src = write(tmp_path / "multi.csv", "id,note\n" + rows)
+    assert run("convert", str(src)) == 0
+    table = pq.read_table(tmp_path / "multi.parquet")
+    assert table.num_rows == 2000
+    assert table.column("note")[1999].as_py() == "line one\nline two 1999"
+
+
+def test_blank_text_cells_become_null(tmp_path):
+    src = write(tmp_path / "b.csv", "zip,country,n\n00501,NA,1\n,US,\n")
+    assert run("convert", str(src)) == 0
+    rows = pq.read_table(tmp_path / "b.parquet").to_pylist()
+    assert rows[1] == {"zip": None, "country": "US", "n": None}
+    assert rows[0]["country"] == "NA", "NA in a text column is data (e.g. Namibia), not missing"
+
+
+def test_row_groups_sized_by_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(datatool, "ROW_GROUP_BYTES", 200_000)
+    wide = ",".join(f"c{i}" for i in range(40))
+    rows = "".join(",".join(f"value-{r}-{c}" for c in range(40)) + "\n" for r in range(5000))
+    src = write(tmp_path / "wide.csv", wide + "\n" + rows)
+    assert run("convert", str(src)) == 0
+    meta = pq.ParquetFile(tmp_path / "wide.parquet").metadata
+    assert meta.num_rows == 5000
+    assert meta.num_row_groups > 1, "a wide file must be split by size, not one huge row group"
+
+
+@pytest.mark.parametrize(("args", "message"), [
+    (["--delimiter", ";;"], "single character"),
+    (["--encoding", "latin-9x"], "unknown encoding"),
+])
+def test_bad_options_are_usage_errors(tmp_path, capsys, args, message):
+    src = write(tmp_path / "x.csv", "a\n1\n")
+    with pytest.raises(SystemExit) as exc:
+        run("convert", str(src), *args)
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_tab_delimiter_by_name(tmp_path):
+    src = write(tmp_path / "t.csv", "a\tb\n1\t2\n")
+    assert run("convert", str(src), "--delimiter", "tab") == 0
+    assert pq.read_table(tmp_path / "t.parquet").column_names == ["a", "b"]
+
+
 def test_unknown_string_column_rejected(tmp_path, capsys):
     src = write(tmp_path / "s.csv", "a\n1\n")
     assert run("convert", str(src), "--string-columns", "nope") == 1
@@ -142,6 +214,7 @@ def make_data_dir(tmp_path: Path) -> Path:
     write(data / "good.csv", "zip,v\n00501,1\n")
     write(data / "ragged.csv", "a,b\n1,2\n3\n")
     write(data / "bad.json", "{not json")
+    write(data / "nan.json", '{"a": NaN}')
     write(data / "events.ndjson", '{"a": 1}\n{"a": 2\n')
     write(data / "my file.csv", "a\n1\n")
     write(data / ".secret", "x")
@@ -158,18 +231,19 @@ def test_validate_reports_each_problem(tmp_path, capsys):
     expectations = {
         "ragged.csv": "different numbers of fields",
         "bad.json": "not valid UTF-8 JSON",
+        "nan.json": "NaN isn't valid JSON",
         "events.ndjson": "line 2",
         "my file.csv": "spaces or special characters",
         ".secret": "won't serve",
         ".half.parquet.tmp": "leftover temp file",
         "report.xlsx": "export to CSV or Parquet",
         "broken.parquet": "not a readable Parquet file",
-        "good.csv": "leading zeros in zip",
+        "good.csv": "zip (leading zeros)",
     }
     for name, text in expectations.items():
         line = next((ln for ln in out.splitlines() if f" {name}:" in ln and text in ln), None)
         assert line, f"expected '{text}' for {name} in:\n{out}"
-    assert "4 error(s)" in out
+    assert "5 error(s)" in out
 
 
 def test_validate_clean_folder_passes(tmp_path):
@@ -196,17 +270,31 @@ def test_catalog_contents_escaping_and_stability(tmp_path, capsys):
     paths = [d["path"] for d in doc["datasets"]]
     assert paths == ["sales.csv", "sales.parquet", "sub/a&b <x>.csv"]
     parquet = next(d for d in doc["datasets"] if d["format"] == "parquet")
-    assert parquet["rows"] == 1 and parquet["columns"][0] == {"name": "id", "type": "int64"}
+    assert parquet["rows"] == 1
+    assert parquet["columns"][0] == {"name": "id", "type": "int64"}
     assert "rows" not in next(d for d in doc["datasets"] if d["path"] == "sales.csv")
     odd = next(d for d in doc["datasets"] if d["path"].startswith("sub/"))
     assert odd["url"] == "/data/sub/a%26b%20%3Cx%3E.csv"
 
     page = (tmp_path / "public" / "catalog.html").read_text(encoding="utf-8")
-    assert "a&amp;b &lt;x&gt;.csv" in page and "<x>" not in page
+    assert "a&amp;b &lt;x&gt;.csv" in page
+    assert "<x>" not in page
 
     capsys.readouterr()
     assert run("catalog", "--data-dir", str(data)) == 0
     assert capsys.readouterr().out.count("Unchanged") == 2, "re-run with no changes must not rewrite files"
+
+
+def test_catalog_lists_unreadable_files_with_error(tmp_path):
+    data = tmp_path / "public" / "data"
+    data.mkdir(parents=True)
+    write(data / "semi.csv", "a;b\n1;2\n")
+    assert run("catalog", "--data-dir", str(data)) == 1
+    doc = json.loads((tmp_path / "public" / "catalog.json").read_text(encoding="utf-8"))
+    entry = doc["datasets"][0]
+    assert entry["path"] == "semi.csv"
+    assert "--delimiter" in entry["error"]
+    assert "Can't read" in (tmp_path / "public" / "catalog.html").read_text(encoding="utf-8")
 
 
 def test_catalog_scan_csv_counts_rows(tmp_path):

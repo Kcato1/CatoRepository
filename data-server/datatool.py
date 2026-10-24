@@ -12,6 +12,7 @@ another one. Exit code 0 means success, 1 means errors were found or a command f
 from __future__ import annotations
 
 import argparse
+import codecs
 import html
 import json
 import os
@@ -27,9 +28,16 @@ import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
 DEFAULT_DATA_DIR = Path(r"C:\DataServer\public\data")
-ROW_GROUP_ROWS = 1_048_576  # pyarrow's default; big enough for scans, small enough for range reads
+ROW_GROUP_ROWS = 1_048_576  # upper bound (pyarrow's default)
+ROW_GROUP_BYTES = 64 << 20  # in-memory size per row group; caps memory on wide files
 BLOCK_SIZE = 4 << 20  # CSV bytes read per batch; also the window pyarrow infers column types from
-LEADING_ZERO = r"^[+-]?0[0-9]"
+# Values pyarrow would turn into numbers and change. Any match keeps the whole column as text.
+CODE_PATTERNS = {
+    "leading zeros": r"^[+-]?0[0-9]",
+    "hex values": r"^[+-]?0[xX][0-9a-fA-F]+$",
+    "leading +": r"^\+[0-9]",
+    "16+ digit numbers": r"^[+-]?[0-9]{16,}(\.[0-9]*)?$",
+}
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 HIDDEN_NAMES = {"desktop.ini", "thumbs.db"}
 SERVED_TYPES = {".csv", ".json", ".ndjson", ".jsonl", ".parquet"}
@@ -55,7 +63,7 @@ class CsvOptions:
 class CsvScan:
     names: list[str]
     rows: int
-    leading_zero_columns: list[str]
+    text_columns: dict[str, str]  # column -> why it must stay text
 
 
 # ---------------------------------------------------------------- shared helpers
@@ -83,17 +91,18 @@ def write_text_atomic(dest: Path, text: str) -> bool:
     return True
 
 
-def read_options(opts: CsvOptions, column_names: list[str] | None = None) -> pacsv.ReadOptions:
-    if column_names is None:
-        return pacsv.ReadOptions(encoding=opts.encoding, block_size=BLOCK_SIZE)
-    return pacsv.ReadOptions(encoding=opts.encoding, block_size=BLOCK_SIZE,
-                             column_names=column_names, skip_rows=1)
+def read_options(opts: CsvOptions) -> pacsv.ReadOptions:
+    return pacsv.ReadOptions(encoding=opts.encoding, block_size=BLOCK_SIZE)
+
+
+def parse_options(opts: CsvOptions) -> pacsv.ParseOptions:
+    # Quoted cells may contain line breaks; without this, one crossing a block boundary fails.
+    return pacsv.ParseOptions(delimiter=opts.delimiter, newlines_in_values=True)
 
 
 def read_header(path: Path, opts: CsvOptions) -> list[str]:
     try:
-        reader = pacsv.open_csv(path, read_options=read_options(opts),
-                                parse_options=pacsv.ParseOptions(delimiter=opts.delimiter))
+        reader = pacsv.open_csv(path, read_options=read_options(opts), parse_options=parse_options(opts))
     except pa.ArrowInvalid as exc:
         raise ToolError(f"{path.name}: {friendly_csv_error(exc, opts)}") from exc
     names = reader.schema.names
@@ -101,9 +110,8 @@ def read_header(path: Path, opts: CsvOptions) -> list[str]:
     if len(names) == 1 and opts.delimiter == ",":
         other = next((d for d in (";", "\t", "|") if d in names[0]), None)
         if other:
-            shown = "tab" if other == "\t" else repr(other)
-            flag = "$'\\t' (or a literal tab)" if other == "\t" else repr(other)
-            raise ToolError(f"{path.name}: the header looks {shown}-separated; add --delimiter {flag}")
+            flag = "tab" if other == "\t" else repr(other)
+            raise ToolError(f"{path.name}: the header looks {flag}-separated; add --delimiter {flag}")
     problems = []
     if any(not n.strip() for n in names):
         problems.append("a column has an empty name")
@@ -129,23 +137,35 @@ def friendly_csv_error(exc: pa.ArrowInvalid, opts: CsvOptions) -> str:
 
 
 def scan_csv(path: Path, opts: CsvOptions) -> CsvScan:
-    """Read every value as text: counts rows, checks encoding and shape, finds leading zeros."""
+    """Read every value as text: counts rows, checks encoding and shape, finds code-like columns."""
     names = read_header(path, opts)
     convert = pacsv.ConvertOptions(column_types={n: pa.string() for n in names}, check_utf8=True)
     rows = 0
-    zero_cols: set[str] = set()
+    reasons: dict[str, str] = {}
     try:
-        reader = pacsv.open_csv(path, read_options=read_options(opts, names),
-                                parse_options=pacsv.ParseOptions(delimiter=opts.delimiter),
+        reader = pacsv.open_csv(path, read_options=read_options(opts), parse_options=parse_options(opts),
                                 convert_options=convert)
         for batch in reader:
             rows += batch.num_rows
             for name, column in zip(names, batch.columns, strict=True):
-                if name not in zero_cols and pc.any(pc.match_substring_regex(column, LEADING_ZERO)).as_py():
-                    zero_cols.add(name)
+                if name not in reasons:
+                    reason = code_like(column)
+                    if reason:
+                        reasons[name] = reason
     except pa.ArrowInvalid as exc:
         raise ToolError(f"{path.name}: {friendly_csv_error(exc, opts)}") from exc
-    return CsvScan(names, rows, [n for n in names if n in zero_cols])
+    return CsvScan(names, rows, {n: reasons[n] for n in names if n in reasons})
+
+
+def code_like(column: pa.Array) -> str | None:
+    for reason, pattern in CODE_PATTERNS.items():
+        if pc.any(pc.match_substring_regex(column, pattern)).as_py():
+            return reason
+    return None
+
+
+def describe_text_columns(text_columns: dict[str, str]) -> str:
+    return ", ".join(f"{name} ({why})" for name, why in text_columns.items())
 
 
 # ---------------------------------------------------------------- convert
@@ -163,24 +183,26 @@ def column_name_from_error(text: str, names: list[str]) -> str | None:
 
 
 def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None:
-    as_text = set(scan.leading_zero_columns) | opts.string_columns
+    as_text = set(scan.text_columns) | opts.string_columns
     convert = pacsv.ConvertOptions(column_types={n: pa.string() for n in as_text}, check_utf8=True)
     writer = None
     pending: list[pa.RecordBatch] = []
+    group_rows = 0
     try:
-        reader = pacsv.open_csv(src, read_options=read_options(opts, scan.names),
-                                parse_options=pacsv.ParseOptions(delimiter=opts.delimiter),
+        reader = pacsv.open_csv(src, read_options=read_options(opts), parse_options=parse_options(opts),
                                 convert_options=convert)
         writer = pq.ParquetWriter(tmp, reader.schema, compression="zstd", write_statistics=True)
         wrote_any = False
         for batch in reader:
+            batch = blanks_to_null(batch)
+            group_rows = group_rows or rows_per_group(batch)
             pending.append(batch)
-            if sum(b.num_rows for b in pending) >= ROW_GROUP_ROWS:
-                pending = write_full_groups(writer, pa.Table.from_batches(pending))
+            if sum(b.num_rows for b in pending) >= group_rows:
+                pending = write_full_groups(writer, pa.Table.from_batches(pending), group_rows)
                 wrote_any = True
         rest = pa.Table.from_batches(pending, schema=reader.schema)
         if rest.num_rows or not wrote_any:  # an empty write still records the schema (header-only CSV)
-            writer.write_table(rest, row_group_size=ROW_GROUP_ROWS)
+            writer.write_table(rest, row_group_size=max(group_rows, 1))
     except pa.ArrowInvalid as exc:
         column = column_name_from_error(str(exc), scan.names)
         if column:
@@ -193,11 +215,28 @@ def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions) -> None
             writer.close()
 
 
-def write_full_groups(writer: pq.ParquetWriter, table: pa.Table) -> list[pa.RecordBatch]:
-    """Write exactly ROW_GROUP_ROWS-row groups; return what's left over for the next write."""
-    while table.num_rows >= ROW_GROUP_ROWS:
-        writer.write_table(table.slice(0, ROW_GROUP_ROWS), row_group_size=ROW_GROUP_ROWS)
-        table = table.slice(ROW_GROUP_ROWS)
+def rows_per_group(batch: pa.RecordBatch) -> int:
+    """Rows per row group: ROW_GROUP_BYTES of data, at most ROW_GROUP_ROWS (0 until rows arrive)."""
+    if batch.num_rows == 0:
+        return 0
+    bytes_per_row = max(batch.nbytes / batch.num_rows, 1)
+    return max(1, min(ROW_GROUP_ROWS, int(ROW_GROUP_BYTES / bytes_per_row)))
+
+
+def blanks_to_null(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Blank text cells become missing values, matching how numeric columns treat blanks."""
+    columns = [
+        pc.if_else(pc.equal(col, ""), pa.scalar(None, pa.string()), col) if pa.types.is_string(col.type) else col
+        for col in batch.columns
+    ]
+    return pa.RecordBatch.from_arrays(columns, schema=batch.schema)
+
+
+def write_full_groups(writer: pq.ParquetWriter, table: pa.Table, group_rows: int) -> list[pa.RecordBatch]:
+    """Write row groups of exactly group_rows rows; return what's left over for the next write."""
+    while table.num_rows >= group_rows:
+        writer.write_table(table.slice(0, group_rows), row_group_size=group_rows)
+        table = table.slice(group_rows)
     return table.to_batches()
 
 
@@ -229,7 +268,7 @@ def convert_one(src: Path, out_dir: Path | None, opts: CsvOptions, force: bool) 
         replace_file(tmp, dest)
     finally:
         tmp.unlink(missing_ok=True)
-    kept = f"; kept as text (leading zeros): {', '.join(scan.leading_zero_columns)}" if scan.leading_zero_columns else ""
+    kept = f"; kept as text: {describe_text_columns(scan.text_columns)}" if scan.text_columns else ""
     print(f"OK    {src.name} -> {dest}  ({meta.num_rows:,} rows, {meta.num_columns} columns, "
           f"{dest.stat().st_size / src.stat().st_size:.0%} of CSV size{kept})")
     return dest
@@ -281,12 +320,16 @@ def check_csv(rel: str, path: Path) -> list[Finding]:
     except ToolError as exc:
         return [Finding("ERROR", rel, str(exc).split(": ", 1)[-1])]
     found = [Finding("NOTE", rel, f"{scan.rows:,} rows, {len(scan.names)} columns")]
-    if scan.leading_zero_columns:
-        found.append(Finding("NOTE", rel, "leading zeros in " + ", ".join(scan.leading_zero_columns) +
-                             " (convert keeps these as text; pandas/DuckDB may read them as numbers)"))
+    if scan.text_columns:
+        found.append(Finding("NOTE", rel, "code-like values in " + describe_text_columns(scan.text_columns) +
+                             "; convert keeps these as text, but pandas/DuckDB may read the CSV as numbers"))
     if path.stat().st_size > 50 << 20:
         found.append(Finding("NOTE", rel, "large CSV; converting to Parquet makes it smaller and faster to query"))
     return found
+
+
+def reject_constant(name: str) -> None:
+    raise ValueError(f"{name} isn't valid JSON (browsers' JSON.parse rejects it)")
 
 
 def check_json(rel: str, path: Path) -> list[Finding]:
@@ -294,8 +337,8 @@ def check_json(rel: str, path: Path) -> list[Finding]:
         return [Finding("NOTE", rel, "too large to check here; consider NDJSON or Parquet")]
     try:
         with path.open(encoding="utf-8") as fh:
-            json.load(fh)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            json.load(fh, parse_constant=reject_constant)
+    except (UnicodeDecodeError, ValueError) as exc:
         return [Finding("ERROR", rel, f"not valid UTF-8 JSON ({exc})"[:200])]
     return []
 
@@ -307,9 +350,11 @@ def check_ndjson(rel: str, path: Path) -> list[Finding]:
                 if not line.strip():
                     continue
                 try:
-                    json.loads(line)
+                    json.loads(line, parse_constant=reject_constant)
                 except json.JSONDecodeError as exc:
                     return [Finding("ERROR", rel, f"invalid JSON on line {number} ({exc.msg})")]
+                except ValueError as exc:
+                    return [Finding("ERROR", rel, f"invalid JSON on line {number} ({exc})")]
     except UnicodeDecodeError:
         return [Finding("ERROR", rel, "not valid UTF-8")]
     return []
@@ -355,11 +400,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- catalog
 
 
-def describe(data_dir: Path, path: Path, scan_csvs: bool) -> dict:
+def basic_entry(data_dir: Path, path: Path) -> dict:
     rel = path.relative_to(data_dir).as_posix()
-    stat = path.stat()
-    entry = {"path": rel, "url": "/data/" + quote(rel), "format": path.suffix.lower().lstrip("."),
-             "bytes": stat.st_size}
+    return {"path": rel, "url": "/data/" + quote(rel), "format": path.suffix.lower().lstrip("."),
+            "bytes": path.stat().st_size}
+
+
+def describe(data_dir: Path, path: Path, scan_csvs: bool) -> dict:
+    entry = basic_entry(data_dir, path)
     if entry["format"] == "parquet":
         meta = pq.ParquetFile(path).metadata
         entry["rows"] = meta.num_rows
@@ -389,6 +437,8 @@ def render_html(entries: list[dict]) -> str:
         col_list = "".join(f"<li><code>{html.escape(c['name'])}</code>"
                            f"{' ' + html.escape(c['type']) if 'type' in c else ''}</li>" for c in cols)
         details = f"<details><summary>{len(cols)} columns</summary><ul>{col_list}</ul></details>" if cols else ""
+        if "error" in e:
+            details += f'<div class="err">Can\'t read: {html.escape(e["error"])}</div>'
         row_count = f"{e['rows']:,}" if "rows" in e else "&ndash;"
         rows.append(
             f"<tr><td><a href=\"{html.escape(e['url'])}\">{html.escape(e['path'])}</a>{details}</td>"
@@ -417,6 +467,7 @@ def render_html(entries: list[dict]) -> str:
   th {{ font-weight: 600; color: var(--muted); font-size: 13px; }}
   .n {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
   details {{ margin-top: 4px; color: var(--muted); font-size: 13px; }}
+  .err {{ margin-top: 4px; color: #b3261e; font-size: 13px; }}
   ul {{ margin: 4px 0 0; padding-left: 18px; }}
   code {{ font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }}
 </style>
@@ -447,7 +498,10 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             entries.append(describe(args.data_dir, path, args.scan_csv))
         except (ToolError, pa.ArrowInvalid, OSError) as exc:
             failures += 1
-            print(f"ERROR {path.name}: {exc}", file=sys.stderr)
+            message = str(exc).removeprefix(f"{path.name}: ")
+            print(f"ERROR {path.name}: {message}", file=sys.stderr)
+            # Still listed: the server serves it either way. Run validate for details.
+            entries.append(basic_entry(args.data_dir, path) | {"error": message})
     doc = json.dumps({"datasets": entries}, indent=2, ensure_ascii=False) + "\n"
     for name, text in (("catalog.json", doc), ("catalog.html", render_html(entries))):
         changed = write_text_atomic(out_dir / name, text)
@@ -457,6 +511,21 @@ def cmd_catalog(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------- CLI
+
+
+def delimiter_arg(value: str) -> str:
+    value = {"tab": "\t", "\\t": "\t"}.get(value.lower(), value)
+    if len(value) != 1:
+        raise argparse.ArgumentTypeError("use a single character, or 'tab'")
+    return value
+
+
+def encoding_arg(value: str) -> str:
+    try:
+        codecs.lookup(value)
+    except LookupError as exc:
+        raise argparse.ArgumentTypeError(f"unknown encoding '{value}' (try cp1252 or utf8)") from exc
+    return value
 
 
 def existing_dir(value: str) -> Path:
@@ -480,8 +549,9 @@ def build_parser() -> argparse.ArgumentParser:
     conv.add_argument("files", nargs="+", type=Path, help="CSV files to convert")
     conv.add_argument("--out-dir", type=Path, help="where to write the .parquet files (default: next to each CSV)")
     conv.add_argument("--force", action="store_true", help="replace existing .parquet files")
-    conv.add_argument("--encoding", default="utf8", help="text encoding of the CSV, e.g. cp1252 (default utf8)")
-    conv.add_argument("--delimiter", default=",", help="field separator (default ,)")
+    conv.add_argument("--encoding", default="utf8", type=encoding_arg,
+                      help="text encoding of the CSV, e.g. cp1252 (default utf8)")
+    conv.add_argument("--delimiter", default=",", type=delimiter_arg, help="field separator: one character or 'tab' (default ,)")
     conv.add_argument("--string-columns", help="comma-separated columns to keep as text")
     conv.set_defaults(func=cmd_convert)
 

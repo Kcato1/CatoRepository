@@ -46,10 +46,11 @@ df = pl.read_parquet("<span class="base"></span>/data/your-file.parquet")</code>
   <h2>Command line</h2>
   <pre><code>curl -O <span class="base"></span>/data/your-file.csv</code></pre>
 </main>
-<script>
+<script type="module">
   for (const el of document.querySelectorAll(".base")) el.textContent = location.origin;
   // Shown once "datatool.py catalog" has been run.
-  fetch("/catalog.json", { method: "HEAD" }).then(r => { if (r.ok) document.getElementById("catalog").hidden = false; });
+  const catalog = await fetch("/catalog.json", { method: "HEAD" });
+  if (catalog.ok) document.getElementById("catalog").hidden = false;
 </script>
 </body>
 </html>

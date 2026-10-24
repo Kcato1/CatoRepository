@@ -103,24 +103,31 @@ Parquet files are typically a quarter of the CSV's size and much faster to query
 The command:
 - Keeps the CSV. If the `.parquet` already exists, it refuses to replace it unless you add `--force`.
 - Writes to a hidden temp file first (the server never serves it). It checks that file's row count and column names, then swaps it in, so readers never see a half-written file.
-- Keeps columns with **leading zeros** (ZIP codes, IDs like `00123`) as text. Otherwise they'd be read as numbers and lose the zeros.
+- Keeps **code-like columns** as text, so they aren't silently changed into numbers. A column stays text if any value has:
+  - leading zeros (ZIP codes, IDs like `00123`)
+  - a hex prefix (`0x1F`)
+  - a leading `+` (phone numbers)
+  - 16 or more digits, which a float can't hold exactly
+
+  Values like `1.10` (a version number) or `1E5` aren't detected, because prices such as `2.50` and scientific notation look the same. If a column holds codes like those, add `--string-columns name`.
 - Stops with a clear message, instead of writing bad data, when:
   - The text isn't UTF-8. Excel exports on Windows are often cp1252: add `--encoding cp1252`.
-  - The file uses `;` or tabs as separators: add `--delimiter ';'`.
+  - The file uses `;` or tabs as separators: add `--delimiter ';'` or `--delimiter tab`.
   - A column looks numeric at first but has text further down: add `--string-columns name`.
   - The header has empty or duplicate column names.
-- Treats `NA`, `N/A`, `NULL`, `NaN` and blanks as missing values **in numeric columns only**. Text columns keep them as written, so `NA` for Namibia stays `NA`.
+- Turns blank cells into missing values in every column. `NA`, `N/A`, `NULL` and `NaN` count as missing only **in numeric columns**; text columns keep them as written, so `NA` for Namibia stays `NA`.
+- Handles quoted cells that contain line breaks, and blank lines before the header.
 
 ### `validate`: check before you publish
 
 `validate` reads every file in the data folder (Parquet only from its footer, so it stays fast) and reports:
-- **Errors:** files that won't work, such as unreadable Parquet, CSVs with inconsistent rows or bad encoding, and invalid JSON or NDJSON (with the line number).
+- **Errors:** files that won't work, such as unreadable Parquet, CSVs with inconsistent rows or bad encoding, and invalid JSON or NDJSON (with the line number). `NaN` and `Infinity` count as invalid, since browsers can't parse them.
 - **Warnings:** names with spaces or special characters (they break URLs and code snippets), spreadsheets (`.xlsx` can't be queried over HTTP), and temp files left by an interrupted run.
 - **Notes:** row and column counts, leading-zero columns, large CSVs worth converting, and hidden files the server won't serve.
 
 ### `catalog`: a page listing every dataset
 
-`catalog` writes `catalog.json` and `catalog.html` next to the `data` folder, so they're served at `/catalog.json` and `/catalog.html`. Each dataset shows its size and columns; Parquet files also show column types and row counts. CSVs show row counts only with `--scan-csv`, since that reads every CSV in full. Run it again after adding files; a re-run with nothing changed doesn't rewrite anything.
+`catalog` writes `catalog.json` and `catalog.html` next to the `data` folder, so they're served at `/catalog.json` and `/catalog.html`. Each dataset shows its size and columns; Parquet files also show column types and row counts. CSVs show row counts only with `--scan-csv`, since that reads every CSV in full. A file that can't be read is still listed, with the reason, because the server serves it anyway. Run it again after adding files; a re-run with nothing changed doesn't rewrite anything.
 
 The landing page links to the catalog once it exists. Installs set up before this change keep their own `index.html`; to get the link, copy `data-server\index.html` over `C:\DataServer\public\index.html`, or just open `/catalog.html`.
 
@@ -148,7 +155,16 @@ To change the Caddy config, edit `data-server/Caddyfile.template` in this repo a
 ## What was tested, and what wasn't
 
 Data tools (`datatool.py`), tested on Linux with pyarrow 26:
-- **Test suite:** 18 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover leading zeros, cp1252, byte-order marks, semicolon files, text appearing late in a numeric column, bad headers, empty and header-only files, row-group sizes, refusing to overwrite, every `validate` finding, and the catalog's escaping, URLs and stability.
+- **Test suite:** 30 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
+  - code-like values (leading zeros, hex, `+`, long numbers)
+  - cp1252, byte-order marks, semicolon and tab files
+  - blank first lines, multi-line cells, and text appearing late in a numeric column
+  - bad headers, empty and header-only files, and blank cells
+  - row groups sized by rows and by memory, and refusing to overwrite
+  - every `validate` finding, including `NaN` in JSON
+  - the catalog's escaping, URLs, stability and listing of unreadable files
+
+  The fixes after the `data-reviewer` subagent's review each have a test that fails on the earlier code.
 - **End to end:** a 200,000-row CSV was converted, validated and cataloged, then served through Caddy with this config and read over HTTP with DuckDB, pandas and Polars. ZIP codes stayed text and dates came through as dates.
 - **Not tested on Windows:**
   - Replacing a `.parquet` while someone is downloading it. Windows may lock the file; the tool then says it's in use instead of failing silently.
