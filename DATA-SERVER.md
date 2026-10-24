@@ -25,7 +25,7 @@ Re-running the script is safe: it updates the install in place and only restarts
 | `-BasicAuthUser kevin` | Require a login; you're prompted for the password (8+ characters) |
 | `-RemoveBasicAuth` | Remove the login. A plain re-run keeps an existing login. |
 | `-BindAddress 192.168.1.50` | Listen on one address only (reserve it in your router first) |
-| `-SetNetworkPrivate` | Switch your home network from Public to Private if needed (see below). Other networks (VPNs, virtual adapters) are left alone. |
+| `-SetNetworkPrivate` | Switch your home network from Public to Private if needed (see below). Other networks (VPNs, virtual adapters) are left alone. If the script can't tell which network is home, it switches nothing; add `-BindAddress <LAN IP>` to choose. |
 | `-AllowSleep` | Don't change sleep settings |
 | `-Uninstall` | Remove the service and firewall rule; files stay |
 

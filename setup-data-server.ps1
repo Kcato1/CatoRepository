@@ -340,7 +340,7 @@ function Set-FirewallRule {
     # second adapters) to Private would open this and other Private-profile rules on them.
     $lanIndex = Get-LanInterfaceIndex
     if ($SetNetworkPrivate -and -not $lanIndex) {
-        Write-Log "Couldn't tell which network is your home network (no default route), so none was switched." "WARNING"
+        Write-Log "Couldn't tell which network is your home network, so none was switched. Re-run with -BindAddress <this PC's LAN IP>." "WARNING"
     }
     $public = @(Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq 'Public' })
     foreach ($net in $public) {
@@ -358,15 +358,22 @@ function Set-FirewallRule {
     }
 }
 
-# The interface of -BindAddress, otherwise the one carrying the default route.
+# The interface of -BindAddress; otherwise the one physical adapter with a default route
+# through a real gateway. Full-tunnel VPNs add their own default route (often with a
+# lower metric), so virtual adapters and on-link routes don't count. If that still leaves
+# more than one candidate, return nothing rather than guess.
 function Get-LanInterfaceIndex {
     if ($BindAddress) {
         return (Get-NetIPAddress -IPAddress $BindAddress).InterfaceIndex
     }
-    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Sort-Object -Property { $_.RouteMetric + $_.InterfaceMetric } |
-        Select-Object -First 1
-    if ($route) { return $route.InterfaceIndex }
+    $physical = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ifIndex)
+    $candidates = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Where-Object { $physical -contains $_.InterfaceIndex -and $_.NextHop -ne '0.0.0.0' } |
+        Select-Object -ExpandProperty InterfaceIndex -Unique)
+    if ($candidates.Count -eq 1) { return $candidates[0] }
+    if ($candidates.Count -gt 1) {
+        Write-Log "More than one network adapter has a route to the internet; use -BindAddress to pick your home network." "WARNING"
+    }
     return $null
 }
 
