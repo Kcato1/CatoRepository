@@ -71,9 +71,16 @@ Set-Alias -Name Require-Administrator -Value Assert-Administrator
 function Invoke-ChocoInstall {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Package
+        [string]$Package,
+
+        # Package parameters that must not appear in Chocolatey's logs (e.g. passwords)
+        [string]$SensitiveParameters
     )
-    & choco install $Package -y --no-progress | Out-Host
+    $chocoArgs = @('install', $Package, '-y', '--no-progress')
+    if ($SensitiveParameters) {
+        $chocoArgs += "--package-parameters-sensitive=$SensitiveParameters"
+    }
+    & choco @chocoArgs | Out-Host
     $exitCode = $LASTEXITCODE
     if ($exitCode -notin $script:ChocoSuccessCodes) {
         throw "choco install $Package failed with exit code $exitCode"
@@ -91,6 +98,19 @@ function Test-ChocoPackage {
     )
     $chocoRoot = if ($env:ChocolateyInstall) { $env:ChocolateyInstall } else { Join-Path $env:ProgramData "chocolatey" }
     return Test-Path (Join-Path $chocoRoot "lib\$Package")
+}
+
+# Find conda.exe. The Anaconda package does not put conda on PATH, so also
+# look in the folders Anaconda installs to. Returns $null when not found.
+function Get-CondaPath {
+    $command = Get-Command conda -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    $candidates = @(
+        "C:\tools\Anaconda3\Scripts\conda.exe",
+        (Join-Path "$env:ProgramData" "Anaconda3\Scripts\conda.exe"),
+        (Join-Path "$env:USERPROFILE" "anaconda3\Scripts\conda.exe")
+    )
+    return $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 
 # Install Chocolatey package manager if not present
@@ -234,6 +254,7 @@ Export-ModuleMember -Function Test-Administrator
 Export-ModuleMember -Function Assert-Administrator
 Export-ModuleMember -Function Invoke-ChocoInstall
 Export-ModuleMember -Function Test-ChocoPackage
+Export-ModuleMember -Function Get-CondaPath
 Export-ModuleMember -Function Install-Chocolatey
 Export-ModuleMember -Function Update-EnvironmentPath
 Export-ModuleMember -Function Install-JavaJDK17
