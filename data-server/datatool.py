@@ -18,9 +18,11 @@ import json
 import math
 import os
 import re
+import secrets
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import quote
 
 import pyarrow as pa
@@ -40,6 +42,7 @@ CODE_PATTERNS = {
     "16+ digit numbers": r"^[+-]?[0-9]{16,}(\.[0-9]*)?$",
 }
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 HIDDEN_NAMES = {"desktop.ini", "thumbs.db"}
 SERVED_TYPES = {".csv", ".json", ".ndjson", ".jsonl", ".parquet"}
 OTHER_TEXT = {".txt", ".md", ".html", ".htm"}
@@ -70,6 +73,11 @@ class CsvScan:
 # ---------------------------------------------------------------- shared helpers
 
 
+def shown(text: object) -> str:
+    """Text safe to print: control characters in file names or cell values can't drive the terminal."""
+    return CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
 def is_hidden(path: Path) -> bool:
     return path.name.startswith(".") or path.name.lower() in HIDDEN_NAMES
 
@@ -82,18 +90,27 @@ def replace_file(tmp: Path, dest: Path) -> None:
         raise ToolError(f"{dest.name} is in use (probably being downloaded); try again in a moment") from exc
 
 
-def temp_path(dest: Path) -> Path:
-    """Hidden (so never served) and unique per process, so two runs can't clobber each other's file."""
-    return dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+def open_temp(dest: Path) -> tuple[Path, BinaryIO]:
+    """A new hidden temp file next to dest (hidden, so never served), with a random name.
+
+    O_EXCL creates it or fails: it never opens an existing file or follows a planted link.
+    """
+    tmp = dest.with_name(f".{dest.name}.{secrets.token_hex(4)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    return tmp, os.fdopen(os.open(tmp, flags, 0o666), "wb")
 
 
 def write_text_atomic(dest: Path, text: str) -> bool:
     """Write text via a hidden temp file; return False if the file already had this content."""
     if dest.exists() and dest.read_text(encoding="utf-8") == text:
         return False
-    tmp = temp_path(dest)
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    replace_file(tmp, dest)
+    tmp, fh = open_temp(dest)
+    try:
+        with fh:
+            fh.write(text.encode("utf-8"))
+        replace_file(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
     return True
 
 
@@ -112,12 +129,11 @@ def read_header(path: Path, opts: CsvOptions) -> list[str]:
     except pa.ArrowInvalid as exc:
         raise ToolError(f"{path.name}: {friendly_csv_error(exc, opts)}") from exc
     names = reader.schema.names
+    other = next((d for d in (";", "\t", "|") if d in names[0]), None)
+    if len(names) == 1 and opts.delimiter == "," and other and other_delimiter_in_rows(reader, other):
+        flag = "tab" if other == "\t" else repr(other)
+        raise ToolError(f"{path.name}: the header looks {flag}-separated; add --delimiter {flag}")
     reader.close()
-    if len(names) == 1 and opts.delimiter == ",":
-        other = next((d for d in (";", "\t", "|") if d in names[0]), None)
-        if other:
-            flag = "tab" if other == "\t" else repr(other)
-            raise ToolError(f"{path.name}: the header looks {flag}-separated; add --delimiter {flag}")
     problems = []
     if any(not n.strip() for n in names):
         problems.append("a column has an empty name")
@@ -127,6 +143,17 @@ def read_header(path: Path, opts: CsvOptions) -> list[str]:
     if problems:
         raise ToolError(f"{path.name}: fix the header row first ({'; '.join(problems)})")
     return names
+
+
+def other_delimiter_in_rows(reader: pacsv.CSVStreamingReader, other: str) -> bool:
+    """Whether the first rows agree with a one-column header that contains another delimiter."""
+    try:
+        values = reader.read_next_batch().column(0).cast(pa.string()).drop_null()
+    except StopIteration:  # header only: the header is all there is to go on
+        return True
+    except pa.ArrowInvalid:  # e.g. "1,5" decimals in a ';' file give ragged rows when read with ','
+        return True
+    return len(values) == 0 or pc.all(pc.match_substring(values, other)).as_py()
 
 
 def friendly_csv_error(exc: pa.ArrowInvalid, opts: CsvOptions) -> str:
@@ -209,7 +236,7 @@ def late_float_column(text: str, names: list[str]) -> str | None:
     return column_name_from_error(text, names)
 
 
-def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions, float_columns: set[str]) -> None:
+def write_parquet(src: Path, sink: BinaryIO, scan: CsvScan, opts: CsvOptions, float_columns: set[str]) -> None:
     as_text = set(scan.text_columns) | opts.string_columns
     types = {n: pa.float64() for n in float_columns} | {n: pa.string() for n in as_text}
     convert = pacsv.ConvertOptions(column_types=types, check_utf8=True)
@@ -218,7 +245,7 @@ def write_parquet(src: Path, tmp: Path, scan: CsvScan, opts: CsvOptions, float_c
     try:
         reader = pacsv.open_csv(src, read_options=read_options(opts), parse_options=parse_options(opts),
                                 convert_options=convert)
-        writer = pq.ParquetWriter(tmp, reader.schema, compression="zstd", write_statistics=True)
+        writer = pq.ParquetWriter(sink, reader.schema, compression="zstd", write_statistics=True)
         wrote_any = False
         for batch in reader:
             if batch.num_rows == 0:
@@ -287,20 +314,25 @@ def convert_one(src: Path, out_dir: Path | None, opts: CsvOptions, force: bool) 
         raise ToolError(f"{dest.name} already exists; add --force to replace it")
     before = src.stat()
     scan = scan_csv(src, opts)
-    missing = opts.string_columns - set(scan.names)
+    by_stripped = {n.strip(): n for n in scan.names}  # a " zip " header can be asked for as zip
+    missing = {c for c in opts.string_columns if c not in scan.names and c not in by_stripped}
     if missing:
         raise ToolError(f"{src.name}: --string-columns names not in the file: {', '.join(sorted(missing))}")
-    tmp = temp_path(dest)
+    opts = replace(opts, string_columns={c if c in scan.names else by_stripped[c] for c in opts.string_columns})
+    tmp, sink = open_temp(dest)
     floats: set[str] = set()
     try:
-        while True:
-            try:
-                write_parquet(src, tmp, scan, opts, floats)
-                break
-            except LateFloat as late:  # e.g. 1, 2, 3 ... then 2.5: store the column as decimals
-                if late.column in floats:
-                    raise ToolError(f"{src.name}: column '{late.column}' couldn't be read as numbers") from late
-                floats.add(late.column)
+        with sink:
+            while True:
+                try:
+                    write_parquet(src, sink, scan, opts, floats)
+                    break
+                except LateFloat as late:  # e.g. 1, 2, 3 ... then 2.5: store the column as decimals
+                    if late.column in floats:
+                        raise ToolError(f"{src.name}: column '{late.column}' couldn't be read as numbers") from late
+                    floats.add(late.column)
+                    sink.seek(0)
+                    sink.truncate()
         meta = verify_parquet(tmp, scan)
         after = src.stat()
         if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
@@ -310,8 +342,8 @@ def convert_one(src: Path, out_dir: Path | None, opts: CsvOptions, force: bool) 
         tmp.unlink(missing_ok=True)
     kept = f"; kept as text: {describe_text_columns(scan.text_columns)}" if scan.text_columns else ""
     kept += f"; decimals found further down: {', '.join(sorted(floats))}" if floats else ""
-    print(f"OK    {src.name} -> {dest}  ({meta.num_rows:,} rows, {meta.num_columns} columns, "
-          f"{dest.stat().st_size / src.stat().st_size:.0%} of CSV size{kept})")
+    size = f"{dest.stat().st_size / before.st_size:.0%} of CSV size" if before.st_size else "empty CSV"
+    print(shown(f"OK    {src.name} -> {dest}  ({meta.num_rows:,} rows, {meta.num_columns} columns, {size}{kept})"))
     return dest
 
 
@@ -326,15 +358,15 @@ def cmd_convert(args: argparse.Namespace) -> int:
         dest = output_path(src, args.out_dir).resolve()
         if dest in claimed:
             failures += 1
-            print(f"ERROR {src} and {claimed[dest]} would both become {dest.name}; "
-                  "convert them into different --out-dir folders", file=sys.stderr)
+            print(shown(f"ERROR {src} and {claimed[dest]} would both become {dest.name}; "
+                        "convert them into different --out-dir folders"), file=sys.stderr)
             continue
         claimed[dest] = src
         try:
             convert_one(src, args.out_dir, opts, args.force)
         except (ToolError, OSError) as exc:  # one locked or unreadable file shouldn't stop the rest
             failures += 1
-            print(f"ERROR {exc}", file=sys.stderr)
+            print(shown(f"ERROR {exc}"), file=sys.stderr)
     return 1 if failures else 0
 
 
@@ -381,6 +413,9 @@ def reject_constant(name: str) -> None:
     raise ValueError(f"{name} isn't valid JSON (browsers' JSON.parse rejects it)")
 
 
+TOO_DEEP = "nested too deeply for Python's JSON parser to check"
+
+
 def check_json(rel: str, path: Path) -> list[Finding]:
     if path.stat().st_size > MAX_JSON_PARSE_BYTES:
         return [Finding("WARN", rel, f"over {MAX_JSON_PARSE_BYTES >> 20} MB, so not checked; "
@@ -390,17 +425,20 @@ def check_json(rel: str, path: Path) -> list[Finding]:
             json.load(fh, parse_constant=reject_constant)
     except ValueError as exc:  # also covers UnicodeDecodeError and JSONDecodeError
         return [Finding("ERROR", rel, f"not valid UTF-8 JSON ({exc})"[:200])]
+    except RecursionError:
+        return [Finding("WARN", rel, TOO_DEEP)]
     return []
 
 
 def check_ndjson(rel: str, path: Path) -> list[Finding]:
     try:
-        with path.open(encoding="utf-8-sig") as fh:  # Notepad/PowerShell 5 add a BOM
-            # Bounded reads, so one enormous record can't use up memory.
-            for number, line in enumerate(iter(lambda: fh.readline(MAX_JSON_PARSE_BYTES), ""), 1):
-                if len(line) == MAX_JSON_PARSE_BYTES and not line.endswith("\n"):
+        with path.open("rb") as fh:
+            # Reads bounded in bytes, so one enormous record can't use up memory.
+            for number, raw in enumerate(iter(lambda: fh.readline(MAX_JSON_PARSE_BYTES), b""), 1):
+                if len(raw) == MAX_JSON_PARSE_BYTES and not raw.endswith(b"\n"):
                     return [Finding("WARN", rel, f"line {number} is over {MAX_JSON_PARSE_BYTES >> 20} MB, "
                                                  "so the rest wasn't checked")]
+                line = raw.decode("utf-8-sig" if number == 1 else "utf-8")  # Notepad/PowerShell 5 add a BOM
                 if not line.strip():
                     continue
                 try:
@@ -409,6 +447,8 @@ def check_ndjson(rel: str, path: Path) -> list[Finding]:
                     return [Finding("ERROR", rel, f"invalid JSON on line {number} ({exc.msg})")]
                 except ValueError as exc:
                     return [Finding("ERROR", rel, f"invalid JSON on line {number} ({exc})")]
+                except RecursionError:
+                    return [Finding("WARN", rel, f"line {number}: {TOO_DEEP}")]
     except UnicodeDecodeError:
         return [Finding("ERROR", rel, "not valid UTF-8")]
     return []
@@ -447,7 +487,7 @@ def iter_files(data_dir: Path):
 def cmd_validate(args: argparse.Namespace) -> int:
     findings = [f for path in iter_files(args.data_dir) for f in validate_file(args.data_dir, path)]
     for f in findings:
-        print(f"{f.level:<5} {f.path}: {f.message}")
+        print(shown(f"{f.level:<5} {f.path}: {f.message}"))
     errors = sum(f.level == "ERROR" for f in findings)
     warnings = sum(f.level == "WARN" for f in findings)
     print(f"\n{errors} error(s), {warnings} warning(s) in {args.data_dir}")
@@ -557,18 +597,24 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         try:
             entries.append(describe(args.data_dir, path, args.scan_csv))
         except (ToolError, pa.ArrowInvalid, OSError) as exc:
-            if not path.exists():  # deleted while the catalog was being built
+            try:
+                entry = basic_entry(args.data_dir, path)
+            except OSError:  # deleted while the catalog was being built
                 continue
             failures += 1
             message = str(exc).removeprefix(f"{path.name}: ")
-            print(f"ERROR {path.name}: {message}", file=sys.stderr)
+            print(shown(f"ERROR {path.name}: {message}"), file=sys.stderr)
             # Still listed: the server serves it either way. Run validate for details.
-            entries.append(basic_entry(args.data_dir, path) | {"error": message})
+            entries.append(entry | {"error": message})
     doc = json.dumps({"datasets": entries}, indent=2, ensure_ascii=False) + "\n"
     # HTML first: the landing page links to catalog.html once catalog.json exists.
     for name, text in (("catalog.html", render_html(entries)), ("catalog.json", doc)):
-        changed = write_text_atomic(out_dir / name, text)
-        print(f"{'Wrote' if changed else 'Unchanged'}: {out_dir / name}")
+        try:
+            changed = write_text_atomic(out_dir / name, text)
+        except OSError as exc:
+            print(shown(f"ERROR can't write {out_dir / name}: {exc.strerror or exc}"), file=sys.stderr)
+            return 1
+        print(shown(f"{'Wrote' if changed else 'Unchanged'}: {out_dir / name}"))
     print(f"{len(entries)} dataset(s)")
     return 1 if failures else 0
 
@@ -635,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except ToolError as exc:
-        print(f"ERROR {exc}", file=sys.stderr)
+        print(shown(f"ERROR {exc}"), file=sys.stderr)
         return 1
 
 

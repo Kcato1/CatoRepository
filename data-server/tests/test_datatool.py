@@ -251,6 +251,44 @@ def test_source_changed_during_convert_is_not_published(tmp_path, capsys, monkey
     assert not (tmp_path / "live.parquet").exists()
 
 
+def test_one_column_csv_with_semicolon_in_header(tmp_path):
+    src = write(tmp_path / "prices.csv", "price;usd\n12\n13\n")
+    assert run("convert", str(src)) == 0
+    assert pq.read_table(tmp_path / "prices.parquet").column_names == ["price;usd"]
+
+
+def test_semicolon_file_with_decimal_commas_still_detected(tmp_path, capsys):
+    src = write(tmp_path / "eu.csv", "a;b\n1,5;2\n3,5;4\n")
+    assert run("convert", str(src)) == 1
+    assert "--delimiter ';'" in capsys.readouterr().err
+
+
+def test_string_columns_match_padded_headers(tmp_path):
+    src = write(tmp_path / "padded.csv", " zip ,n\n123,1\n")
+    assert run("convert", str(src), "--string-columns", "zip") == 0
+    assert str(pq.read_table(tmp_path / "padded.parquet").schema.field(" zip ").type) == "string"
+
+
+def test_temp_file_never_follows_a_planted_link(tmp_path, capsys, monkeypatch):
+    victim = write(tmp_path / "victim.txt", "keep me")
+    src = write(tmp_path / "sales.csv", "a\n1\n")
+    monkeypatch.setattr(datatool.secrets, "token_hex", lambda n: "fixed")
+    (tmp_path / ".sales.parquet.fixed.tmp").symlink_to(victim)
+    assert run("convert", str(src)) == 1
+    assert victim.read_text() == "keep me"
+    assert not (tmp_path / "sales.parquet").exists()
+
+
+def test_control_characters_in_names_are_escaped(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    write(data / "evil\x1b[2J.csv", "a\n1\n")
+    run("validate", "--data-dir", str(data))
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "evil\\x1b[2J.csv" in out
+
+
 def test_empty_batch_from_reader_does_not_hang(tmp_path, monkeypatch):
     real_open = datatool.pacsv.open_csv
 
@@ -393,6 +431,26 @@ def test_validate_limits(tmp_path, capsys, monkeypatch):
     assert "WARN  long.ndjson: line 2 is over" in out
 
 
+def test_validate_deep_json_is_a_warning(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    write(data / "deep.json", "[" * 100_000 + "]" * 100_000)
+    write(data / "ok.csv", "a\n1\n")
+    assert run("validate", "--data-dir", str(data)) == 0
+    out = capsys.readouterr().out
+    assert "WARN  deep.json: nested too deeply" in out
+    assert "NOTE  ok.csv: 1 rows" in out
+
+
+def test_validate_ndjson_limit_counts_bytes(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(datatool, "MAX_JSON_PARSE_BYTES", 64)
+    data = tmp_path / "data"
+    data.mkdir()
+    write(data / "wide.ndjson", '{"a": "' + "é" * 40 + '"}\n')  # 40 characters, but over 64 bytes
+    assert run("validate", "--data-dir", str(data)) == 0
+    assert "WARN  wide.ndjson: line 1 is over" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- catalog
 
 
@@ -444,6 +502,15 @@ def test_catalog_lists_datasets_named_like_its_own_files(tmp_path):
     assert run("catalog", "--data-dir", str(data)) == 0
     doc = json.loads((tmp_path / "public" / "catalog.json").read_text(encoding="utf-8"))
     assert [e["path"] for e in doc["datasets"]] == ["sub/catalog.json"]
+
+
+def test_catalog_write_error_is_reported(tmp_path, capsys):
+    data = tmp_path / "data"
+    data.mkdir()
+    write(data / "ok.csv", "a\n1\n")
+    (tmp_path / "catalog.html").mkdir()  # can't be replaced by a file
+    assert run("catalog", "--data-dir", str(data)) == 1
+    assert "ERROR can't write" in capsys.readouterr().err
 
 
 def test_catalog_scan_csv_counts_rows(tmp_path):

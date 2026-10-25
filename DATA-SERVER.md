@@ -126,7 +126,7 @@ The command:
 
 `validate` reads every file in the data folder (Parquet only from its footer, so it stays fast) and reports:
 - **Errors:** files that won't work, such as unreadable Parquet, CSVs with inconsistent rows or bad encoding, and invalid JSON or NDJSON (with the line number). `NaN` and `Infinity` count as invalid, since browsers can't parse them.
-- **Warnings:** names with spaces or special characters, in the file or its folders (they break URLs and code snippets), JSON files over 200 MB and NDJSON lines over 200 MB (too big to check), spreadsheets (`.xlsx` can't be queried over HTTP), and temp files left by an interrupted run.
+- **Warnings:** names with spaces or special characters, in the file or its folders (they break URLs and code snippets), JSON files over 200 MB and NDJSON lines over 200 MB (too big to check), JSON nested too deeply to check, spreadsheets (`.xlsx` can't be queried over HTTP), and temp files left by an interrupted run.
 - **Notes:** row and column counts, leading-zero columns, large CSVs worth converting, and hidden files the server won't serve.
 
 ### `catalog`: a page listing every dataset
@@ -159,9 +159,9 @@ To change the Caddy config, edit `data-server/Caddyfile.template` in this repo a
 ## What was tested, and what wasn't
 
 Data tools (`datatool.py`), tested on Linux with pyarrow 26:
-- **Test suite:** 41 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
+- **Test suite:** 49 tests in `data-server/tests`, run with `python -m pytest data-server/tests`. They cover:
   - code-like values (leading zeros, hex, `+`, long numbers)
-  - cp1252, byte-order marks, semicolon and tab files
+  - cp1252, byte-order marks, semicolon and tab files (and one-column files with `;` in the header)
   - blank first lines, multi-line cells, and text or decimals appearing late in a numeric column
   - bad headers, empty and header-only files, and blank cells
   - row groups sized by rows and by memory, as rows get wider or narrower through the file
