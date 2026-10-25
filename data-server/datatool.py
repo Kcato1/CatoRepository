@@ -301,6 +301,30 @@ def verify_parquet(tmp: Path, scan: CsvScan) -> pq.FileMetaData:
     return meta
 
 
+def resolve_string_columns(src: Path, scan: CsvScan, opts: CsvOptions) -> CsvOptions:
+    """Map --string-columns to the file's exact headers; a " zip " header can be asked for as zip."""
+    by_stripped = {n.strip(): n for n in scan.names}
+    missing = {c for c in opts.string_columns if c not in scan.names and c not in by_stripped}
+    if missing:
+        raise ToolError(f"{src.name}: --string-columns names not in the file: {', '.join(sorted(missing))}")
+    return replace(opts, string_columns={c if c in scan.names else by_stripped[c] for c in opts.string_columns})
+
+
+def write_with_late_floats(src: Path, sink: BinaryIO, scan: CsvScan, opts: CsvOptions) -> set[str]:
+    """Write the Parquet data, re-reading as decimals any integer column that has decimals further down."""
+    floats: set[str] = set()
+    while True:
+        try:
+            write_parquet(src, sink, scan, opts, floats)
+            return floats
+        except LateFloat as late:  # e.g. 1, 2, 3 ... then 2.5
+            if late.column in floats:
+                raise ToolError(f"{src.name}: column '{late.column}' couldn't be read as numbers") from late
+            floats.add(late.column)
+            sink.seek(0)
+            sink.truncate()
+
+
 def convert_one(src: Path, out_dir: Path | None, opts: CsvOptions, force: bool) -> Path:
     if src.suffix.lower() != ".csv":
         raise ToolError(f"{src.name}: only .csv files can be converted")
@@ -314,25 +338,11 @@ def convert_one(src: Path, out_dir: Path | None, opts: CsvOptions, force: bool) 
         raise ToolError(f"{dest.name} already exists; add --force to replace it")
     before = src.stat()
     scan = scan_csv(src, opts)
-    by_stripped = {n.strip(): n for n in scan.names}  # a " zip " header can be asked for as zip
-    missing = {c for c in opts.string_columns if c not in scan.names and c not in by_stripped}
-    if missing:
-        raise ToolError(f"{src.name}: --string-columns names not in the file: {', '.join(sorted(missing))}")
-    opts = replace(opts, string_columns={c if c in scan.names else by_stripped[c] for c in opts.string_columns})
+    opts = resolve_string_columns(src, scan, opts)
     tmp, sink = open_temp(dest)
-    floats: set[str] = set()
     try:
         with sink:
-            while True:
-                try:
-                    write_parquet(src, sink, scan, opts, floats)
-                    break
-                except LateFloat as late:  # e.g. 1, 2, 3 ... then 2.5: store the column as decimals
-                    if late.column in floats:
-                        raise ToolError(f"{src.name}: column '{late.column}' couldn't be read as numbers") from late
-                    floats.add(late.column)
-                    sink.seek(0)
-                    sink.truncate()
+            floats = write_with_late_floats(src, sink, scan, opts)
         meta = verify_parquet(tmp, scan)
         after = src.stat()
         if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
@@ -594,18 +604,31 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     for path in iter_files(args.data_dir):
         if is_hidden(path) or path.suffix.lower() not in SERVED_TYPES or path.resolve() in outputs:
             continue
+        entry = catalog_entry(args.data_dir, path, args.scan_csv)
+        if entry is not None:
+            entries.append(entry)
+            failures += "error" in entry
+    if not write_catalog(out_dir, entries):
+        return 1
+    print(f"{len(entries)} dataset(s)")
+    return 1 if failures else 0
+
+
+def catalog_entry(data_dir: Path, path: Path, scan_csvs: bool) -> dict | None:
+    """The file's entry; one that can't be read is still listed with the reason, since it's served anyway."""
+    try:
+        return describe(data_dir, path, scan_csvs)
+    except (ToolError, pa.ArrowInvalid, OSError) as exc:
         try:
-            entries.append(describe(args.data_dir, path, args.scan_csv))
-        except (ToolError, pa.ArrowInvalid, OSError) as exc:
-            try:
-                entry = basic_entry(args.data_dir, path)
-            except OSError:  # deleted while the catalog was being built
-                continue
-            failures += 1
-            message = str(exc).removeprefix(f"{path.name}: ")
-            print(shown(f"ERROR {path.name}: {message}"), file=sys.stderr)
-            # Still listed: the server serves it either way. Run validate for details.
-            entries.append(entry | {"error": message})
+            entry = basic_entry(data_dir, path)
+        except OSError:  # deleted while the catalog was being built
+            return None
+        message = str(exc).removeprefix(f"{path.name}: ")
+        print(shown(f"ERROR {path.name}: {message}"), file=sys.stderr)
+        return entry | {"error": message}
+
+
+def write_catalog(out_dir: Path, entries: list[dict]) -> bool:
     doc = json.dumps({"datasets": entries}, indent=2, ensure_ascii=False) + "\n"
     # HTML first: the landing page links to catalog.html once catalog.json exists.
     for name, text in (("catalog.html", render_html(entries)), ("catalog.json", doc)):
@@ -613,10 +636,9 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             changed = write_text_atomic(out_dir / name, text)
         except OSError as exc:
             print(shown(f"ERROR can't write {out_dir / name}: {exc.strerror or exc}"), file=sys.stderr)
-            return 1
+            return False
         print(shown(f"{'Wrote' if changed else 'Unchanged'}: {out_dir / name}"))
-    print(f"{len(entries)} dataset(s)")
-    return 1 if failures else 0
+    return True
 
 
 # ---------------------------------------------------------------- CLI
