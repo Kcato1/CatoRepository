@@ -20,7 +20,7 @@ import os
 import re
 import secrets
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import quote
@@ -307,7 +307,8 @@ def resolve_string_columns(src: Path, scan: CsvScan, opts: CsvOptions) -> CsvOpt
     missing = {c for c in opts.string_columns if c not in scan.names and c not in by_stripped}
     if missing:
         raise ToolError(f"{src.name}: --string-columns names not in the file: {', '.join(sorted(missing))}")
-    return replace(opts, string_columns={c if c in scan.names else by_stripped[c] for c in opts.string_columns})
+    exact = {c if c in scan.names else by_stripped[c] for c in opts.string_columns}
+    return CsvOptions(opts.encoding, opts.delimiter, exact)
 
 
 def write_with_late_floats(src: Path, sink: BinaryIO, scan: CsvScan, opts: CsvOptions) -> set[str]:
