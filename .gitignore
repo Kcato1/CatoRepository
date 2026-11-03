@@ -84,3 +84,6 @@ $RECYCLE.BIN/
 # Python
 __pycache__/
 .pytest_cache/
+
+# VS Code Code Runner scratch files
+tempCodeRunnerFile.*
